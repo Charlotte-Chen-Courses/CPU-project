@@ -61,18 +61,18 @@ module pipeline (
     // Pipeline register enables
     logic if_id_enable, id_ex_enable, ex_mem_enable, mem_wb_enable;
 
-    // Outputs from IF-Stage and IF/DIS Pipeline Register
+    // Outputs from IF-Stage and IF/ID Pipeline Register
     logic [`XLEN-1:0] proc2Imem_addr;
-    IF_DIS_PACKET if_packet, if_dis_reg;
+    IF_ID_PACKET if_packet, if_id_reg;
 
-    // Outputs from DIS stage and DIS/RM Pipeline Register
-    DIS_RM_PACKET dis_packet, dis_rm_reg;
+    // Outputs from ID stage and ID/EX Pipeline Register
+    ID_EX_PACKET id_packet, id_ex_reg;
 
-    // Outputs from RM-Stage and RM/RSB Pipeline Register
-    RM_RSB_PACKET rm_packet, rm_rsb_reg;
+    // Outputs from EX-Stage and EX/MEM Pipeline Register
+    EX_MEM_PACKET ex_packet, ex_mem_reg;
 
-    // Outputs from RSB-Stage and RSB/EX Pipeline Register
-    RSB_EX_PACKET rsb_packet, rsb_ex_reg;
+    // Outputs from MEM-Stage and MEM/WB Pipeline Register
+    MEM_WB_PACKET mem_packet, mem_wb_reg;
 
     // Outputs from MEM-Stage to memory
     logic [`XLEN-1:0] proc2Dmem_addr;
@@ -112,145 +112,6 @@ module pipeline (
         end
         proc2mem_data = {32'b0, proc2Dmem_data};
     end
-
-
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //                  IF-Stage                    //
-    //                                              //
-    //////////////////////////////////////////////////
-    stage_if stage_if_0 (
-        // Inputs
-        .clock (clock),
-        .reset (reset),
-        .Imem2proc_data         (mem2proc_data),
-
-        // Outputs
-        .if_packet              (if_packet),
-        .proc2Imem_addr         (proc2Imem_addr)
-    );
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //            IF/DIS Pipeline Register          //
-    //                                              //
-    //////////////////////////////////////////////////
-    assign if_dis_enable = 1'b1; // always enabled
-    // synopsys sync_set_reset "reset"
-    always_ff @(posedge clock) begin
-        if (reset) begin
-            if_dis_reg.inst  <= `NOP;
-            if_dis_reg.valid <= `FALSE;
-            if_dis_reg.NPC   <= 0;
-            if_dis_reg.PC    <= 0;
-        end else if (if_dis_enable) begin
-            if_dis_reg <= if_packet;
-        end 
-    end
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //                  DIS-Stage                   //
-    //                                              //
-    //////////////////////////////////////////////////
-
-    stage_dis stage_dis_0 (
-        // Inputs
-        .clock             (clock),
-        .reset             (reset),
-        .if_dis_reg        (if_dis_reg),
-        .wb_regfile_en     (wb_regfile_en),
-        .wb_regfile_idx    (wb_regfile_idx),
-        .wb_regfile_data   (wb_regfile_data),
-
-        // Output
-        .dis_packet        (dis_packet)
-    );
-
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //            DIS/RM Pipeline Register          //
-    //                                              //
-    //////////////////////////////////////////////////
-
-    assign dis_rm_enable = 1'b1; // always enabled
-    // synopsys sync_set_reset "reset"
-    always_ff @(posedge clock) begin
-        if (reset) begin
-            dis_rm_reg <= '{
-                `NOP, // we can't simply assign 0 because NOP is non-zero
-                {`XLEN{1'b0}},  // PC
-                {`XLEN{1'b0}},  // NPC
-                {`XLEN{1'b0}},  // rs1 select
-                {`XLEN{1'b0}},  // rs2 select
-                OPA_IS_RS1,     // opa_select
-                OPB_IS_RS2,     // opb_select
-                `ZERO_REG,      // dest_reg_idx
-                ALU_ADD,        // fu_func
-                ALU,            // fu_mark
-                1'b0,           // rd_mem
-                1'b0,           // wr_mem
-                1'b0,           // cond
-                1'b0,           // uncond
-                1'b0,           // halt
-                1'b0,           // illegal
-                1'b0,           // csr_op
-                1'b0            // valid
-            };
-        end else if (dis_rm_enable) begin
-            dis_rm_reg <= dis_packet;
-        end
-    end
-
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //                  RM-Stage                    //
-    //                                              //
-    //////////////////////////////////////////////////
-
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //          RM/RS-ROB Pipeline Register         //
-    //                                              //
-    //////////////////////////////////////////////////
-
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //                 RS-ROB-Stage                 //
-    //                                              //
-    //////////////////////////////////////////////////
-
-    stage_rsb stage_rsb_0 (
-        // Inputs
-        .clock             (clock),
-        .reset             (reset),
-        .rm_rsb_reg        (rm_rsb_reg),
-
-        // Output
-        .rsb_packet        (rsb_packet)
-
-    );
-
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //          RS-ROB/EX Pipeline Register         //
-    //                                              //
-    //////////////////////////////////////////////////
-
-
-
-    //////////////////////////////////////////////////
-    //                                              //
-    //                  EX-Stage                    //
-    //                                              //
-    //////////////////////////////////////////////////
-
 
     //////////////////////////////////////////////////
     //                                              //

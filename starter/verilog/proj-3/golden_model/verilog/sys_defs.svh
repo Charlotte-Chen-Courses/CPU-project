@@ -13,34 +13,6 @@
 // all files should `include "sys_defs.svh" to at least define the timescale
 `timescale 1ns/100ps
 
-///////////////////////////////////
-// ---- Starting Parameters ---- //
-///////////////////////////////////
-
-// some starting parameters that you should set
-// this is *your* processor, you decide these values (try analyzing which is best!)
-
-// superscalar width
-`define N 1
-
-// sizes
-`define ROB_SZ xx
-`define RS_SZ xx
-`define PHYS_REG_SZ (32 + `ROB_SZ)
-
-// worry about these later
-`define BRANCH_PRED_SZ xx
-`define LSQ_SZ xx
-
-// functional units (you should decide if you want more or fewer types of FUs)
-`define NUM_FU_ALU xx
-`define NUM_FU_MULT xx
-`define NUM_FU_LOAD xx
-`define NUM_FU_STORE xx
-
-// number of mult stages (2, 4, or 8)
-`define MULT_STAGES 4
-
 ///////////////////////////////
 // ---- Basic Constants ---- //
 ///////////////////////////////
@@ -66,21 +38,11 @@
 // ---- Memory Definitions ---- //
 //////////////////////////////////
 
-// Cache mode removes the byte-level interface from memory, so it always returns
-// a double word. The original processor won't work with this defined. Your new
-// processor will have to account for this effect on mem.
-// Notably, you can no longer write data without first reading.
-`define CACHE_MODE
-
-// you are not allowed to change this definition for your final processor
+// this will change for project 4
 // the project 3 processor has a massive boost in performance just from having no mem latency
 // see if you can beat it's CPI in project 4 even with a 100ns latency!
-// `define MEM_LATENCY_IN_CYCLES  0
-`define MEM_LATENCY_IN_CYCLES (100.0/`CLOCK_PERIOD+0.49999)
-// the 0.49999 is to force ceiling(100/period). The default behavior for
-// float to integer conversion is rounding to nearest
+`define MEM_LATENCY_IN_CYCLES  0
 
-// How many memory requests can be waiting at once
 `define NUM_MEM_TAGS 15
 
 `define MEM_SIZE_IN_BYTES (64*1024)
@@ -139,6 +101,51 @@ typedef enum logic [3:0] {
     HALTED_ON_WFI       = 4'he, // 'Wait For Interrupt'. In 470, signifies the end of computation
     STORE_PAGE_FAULT    = 4'hf
 } EXCEPTION_CODE;
+
+////////////////////////////////////////
+// ---- Datapath Control Signals ---- //
+////////////////////////////////////////
+
+// ALU opA input mux selects
+typedef enum logic [1:0] {
+    OPA_IS_RS1  = 2'h0,
+    OPA_IS_NPC  = 2'h1,
+    OPA_IS_PC   = 2'h2,
+    OPA_IS_ZERO = 2'h3
+} ALU_OPA_SELECT;
+
+// ALU opB input mux selects
+typedef enum logic [3:0] {
+    OPB_IS_RS2    = 4'h0,
+    OPB_IS_I_IMM  = 4'h1,
+    OPB_IS_S_IMM  = 4'h2,
+    OPB_IS_B_IMM  = 4'h3,
+    OPB_IS_U_IMM  = 4'h4,
+    OPB_IS_J_IMM  = 4'h5
+} ALU_OPB_SELECT;
+
+// ALU function code input
+// probably want to leave these alone
+typedef enum logic [4:0] {
+    ALU_ADD     = 5'h00,
+    ALU_SUB     = 5'h01,
+    ALU_SLT     = 5'h02,
+    ALU_SLTU    = 5'h03,
+    ALU_AND     = 5'h04,
+    ALU_OR      = 5'h05,
+    ALU_XOR     = 5'h06,
+    ALU_SLL     = 5'h07,
+    ALU_SRL     = 5'h08,
+    ALU_SRA     = 5'h09,
+    ALU_MUL     = 5'h0a,
+    ALU_MULH    = 5'h0b,
+    ALU_MULHSU  = 5'h0c,
+    ALU_MULHU   = 5'h0d,
+    ALU_DIV     = 5'h0e,
+    ALU_DIVU    = 5'h0f,
+    ALU_REM     = 5'h10,
+    ALU_REMU    = 5'h11
+} ALU_FUNC;
 
 ///////////////////////////////////
 // ---- Instruction Typedef ---- //
@@ -219,50 +226,6 @@ typedef union packed {
 
 } INST; // instruction typedef, this should cover all types of instructions
 
-////////////////////////////////////////
-// ---- Datapath Control Signals ---- //
-////////////////////////////////////////
-
-// ALU opA input mux selects
-typedef enum logic [1:0] {
-    OPA_IS_RS1  = 2'h0,
-    OPA_IS_NPC  = 2'h1,
-    OPA_IS_PC   = 2'h2,
-    OPA_IS_ZERO = 2'h3
-} ALU_OPA_SELECT;
-
-// ALU opB input mux selects
-typedef enum logic [3:0] {
-    OPB_IS_RS2    = 4'h0,
-    OPB_IS_I_IMM  = 4'h1,
-    OPB_IS_S_IMM  = 4'h2,
-    OPB_IS_B_IMM  = 4'h3,
-    OPB_IS_U_IMM  = 4'h4,
-    OPB_IS_J_IMM  = 4'h5
-} ALU_OPB_SELECT;
-
-// ALU function code input
-// probably want to leave these alone
-typedef enum logic [4:0] {
-    ALU_ADD     = 5'h00,
-    ALU_SUB     = 5'h01,
-    ALU_SLT     = 5'h02,
-    ALU_SLTU    = 5'h03,
-    ALU_AND     = 5'h04,
-    ALU_OR      = 5'h05,
-    ALU_XOR     = 5'h06,
-    ALU_SLL     = 5'h07,
-    ALU_SRL     = 5'h08,
-    ALU_SRA     = 5'h09,
-    ALU_MUL     = 5'h0a, // Mult FU
-    ALU_MULH    = 5'h0b, // Mult FU
-    ALU_MULHSU  = 5'h0c, // Mult FU
-    ALU_MULHU   = 5'h0d, // Mult FU
-    ALU_DIV     = 5'h0e, // unused
-    ALU_DIVU    = 5'h0f, // unused
-    ALU_REM     = 5'h10, // unused
-    ALU_REMU    = 5'h11  // unused
-} ALU_FUNC;
 
 ////////////////////////////////
 // ---- Datapath Packets ---- //
@@ -309,7 +272,7 @@ typedef struct packed {
     logic       uncond_branch; // Is inst an unconditional branch?
     logic       halt;          // Is this a halt?
     logic       illegal;       // Is this instruction illegal?
-    logic       csr_op;        // Is this a CSR operation? (we use this to get return code)
+    logic       csr_op;        // Is this a CSR operation? (we only used this as a cheap way to get return code)
 
     logic       valid;
 } ID_EX_PACKET;
