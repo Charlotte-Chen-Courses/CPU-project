@@ -35,7 +35,10 @@ module freelist #(
 
   // slot i's offset from the pointer = number of earlier slots that also requested/freed
   logic [`SUPERSCALAR_WIDTH-1:0][PTR_W-1:0] alloc_idx, free_idx;
-  int n_alloc, n_free, free_count;
+  logic [$clog2(
+`FREE_LIST_SZ+1
+)-1:0] free_count;  // 0..FREE_LIST_SZ, sized so synthesis doesn't build 32 bits
+  int n_alloc, n_free;
 
   // ---- combinational: this cycle's outputs ----
   always_comb begin
@@ -50,12 +53,12 @@ module freelist #(
     end
   end
 
-  assign alloc_ok = (free_count >= n_alloc);
+  assign alloc_ok = (int'(free_count) >= n_alloc);
 
   // ---- sequential: next cycle's state ----
   always_ff @(posedge clock) begin
     if (reset) begin
-      for (int i = 0; i < `FREE_LIST_SZ; i++) freelist_mem[i] <= TAG_W'(32 + i);
+      for (int i = 0; i < `FREE_LIST_SZ; i++) freelist_mem[i] <= TAG_W'(`ARCH_REG_SZ + i);
       alloc_ptr  <= '0;
       free_ptr   <= '0;
       free_count <= `FREE_LIST_SZ;
@@ -65,8 +68,21 @@ module freelist #(
 
       free_ptr <= PTR_W'((int'(free_ptr) + n_free) % `FREE_LIST_SZ);
       if (alloc_ok) alloc_ptr <= PTR_W'((int'(alloc_ptr) + n_alloc) % `FREE_LIST_SZ);
-      free_count <= free_count + n_free - (alloc_ok ? n_alloc : 0);
+      free_count <= $bits(free_count)'(int'(free_count) + n_free - (alloc_ok ? n_alloc : 0));
     end
   end
+
+  // ---- simulation checks: these fire only on bugs elsewhere in the core ----
+  // synopsys translate_off
+  always_ff @(posedge clock) begin
+    if (!reset) begin
+      assert (int'(free_count) + n_free - (alloc_ok ? n_alloc : 0) <= `FREE_LIST_SZ)
+      else $error("freelist overflow: double free or bad free_en");
+      for (int j = 0; j < `SUPERSCALAR_WIDTH; j++)
+      assert (!(free_en[j] && free_tag[j] == 0))
+      else $error("freelist: freeing preg 0 (slot %0d)", j);
+    end
+  end
+  // synopsys translate_on
 
 endmodule

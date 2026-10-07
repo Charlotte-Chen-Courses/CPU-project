@@ -25,10 +25,13 @@
 
 // sizes
 `define NUM_CDB 2
-`define ROB_SZ 32
+
 `define RS_SZ xx
-`define FREE_LIST_SZ (`PHYS_REG_SZ - 32)
-`define PHYS_REG_SZ (32 + `ROB_SZ)
+`define ARCH_REG_SZ 32
+`define ROB_SZ 32
+`define PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)
+`define FREE_LIST_SZ (`PHYS_REG_SZ - `ARCH_REG_SZ)
+
 
 // worry about these later
 `define BRANCH_PRED_SZ xx
