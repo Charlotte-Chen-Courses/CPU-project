@@ -1,3 +1,24 @@
+/////////////////////////////////////////////////////////////////////////
+//                                                                     //
+//   Modulename :  rob.sv                                              //
+//                                                                     //
+//  Description :  Reorder buffer. Circular queue of ROB_SZ entries    //
+//                 holding in-flight instructions in program order     //
+//                 (no data values: results live in the PRF).          //
+//                 Dispatch: writes up to WIDTH entries at the tail;   //
+//                 valid slots need not be packed, and each slot gets  //
+//                 its ROB index back on disp_idx. space_ok = room     //
+//                 for a full bundle, from state only (no dependence   //
+//                 on disp_valid). Complete: each CDB marks its entry  //
+//                 done by index. Commit: up to WIDTH entries leave    //
+//                 from the head, in order, stopping at the first one  //
+//                 not done; the count check keeps stale done bits in  //
+//                 empty entries from committing. Commit outputs feed  //
+//                 the freelist (told) and retirement RAT (rd, tag).   //
+//                 No flush / mispredict recovery yet.                 //
+//                                                                     //
+/////////////////////////////////////////////////////////////////////////
+
 `include "verilog/sys_defs.svh"
 
 module rob #(
@@ -5,7 +26,7 @@ module rob #(
     localparam W = `SUPERSCALAR_WIDTH,
     localparam CDB_SZ = `NUM_CDB,
     localparam ROB_SZ = `ROB_SZ,
-    localparam PTR_W = $clog2(ROB_SZ)
+    localparam PTR_W = `ROB_IDX_W
 ) (
     input clock,
     reset,
@@ -79,7 +100,7 @@ module rob #(
       rob_count <= $bits(rob_count)'(int'(rob_count) + n_disp - n_commit);
 
       for (int cdb_idx = 0; cdb_idx < CDB_SZ; cdb_idx++)
-      if (cdb_valid[cdb_idx]) rob_map[cdb_rob_idx[cdb_idx]].done <= 1'b1;
+      if (cdb_valid[cdb_idx]) rob_map[cdb_rob_idx[cdb_idx]].done <= `TRUE;
     end
   end
 

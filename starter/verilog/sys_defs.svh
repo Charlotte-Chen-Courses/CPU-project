@@ -26,12 +26,14 @@
 // sizes
 `define NUM_CDB 2
 
-`define RS_SZ xx
+`define RS_SZ 16
 `define ARCH_REG_SZ 32
 `define ROB_SZ 32
 `define PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)
 `define FREE_LIST_SZ (`PHYS_REG_SZ - `ARCH_REG_SZ)
 `define TAG_W $clog2(`PHYS_REG_SZ)
+`define ROB_IDX_W $clog2(`ROB_SZ)
+`define RS_IDX_W $clog2(`RS_SZ)
 
 
 // worry about these later
@@ -374,6 +376,23 @@ typedef struct packed {
   logic [`TAG_W-1:0] tag;
   logic [`TAG_W-1:0] told;
 } ROB_PACKET;
+
+
+/**
+ * RS Packet:
+ * 
+ */
+typedef struct packed {
+  logic [`TAG_W-1:0]     src1_tag;
+  logic                  src1_ready;
+  logic [`TAG_W-1:0]     src2_tag;
+  logic                  src2_ready;
+  logic [`TAG_W-1:0]     dest_tag;
+  logic [`ROB_IDX_W-1:0] rob_idx;
+
+  // TODO: other fields
+
+} RS_PACKET;
 
 
 
