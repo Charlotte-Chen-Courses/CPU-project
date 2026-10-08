@@ -13,7 +13,7 @@
 SRC   := starter
 BUILD := build
 
-TESTS := prf freelist rat
+TESTS := prf freelist rat rob
 
 # extra sources per module, e.g. DEPS_mult := $(SRC)/verilog/mult_stage.sv
 DEPS_prf :=

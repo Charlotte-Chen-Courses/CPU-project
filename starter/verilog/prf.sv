@@ -14,9 +14,9 @@
 `include "verilog/sys_defs.svh"
 
 module prf #(
-    parameter RD_SZ = 2 * `SUPERSCALAR_WIDTH,
-    parameter WR_SZ = `NUM_CDB,
-    parameter TAG_W = $clog2(`PHYS_REG_SZ)
+    parameter  RD_SZ = 2 * `SUPERSCALAR_WIDTH,
+    parameter  WR_SZ = `NUM_CDB,
+    localparam TAG_W = `TAG_W
 ) (
     input                               clock,    // system clock
     // note: no system reset, register values must be written before they can be read

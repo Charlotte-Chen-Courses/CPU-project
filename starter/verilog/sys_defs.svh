@@ -31,6 +31,7 @@
 `define ROB_SZ 32
 `define PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)
 `define FREE_LIST_SZ (`PHYS_REG_SZ - `ARCH_REG_SZ)
+`define TAG_W $clog2(`PHYS_REG_SZ)
 
 
 // worry about these later
@@ -360,5 +361,20 @@ typedef struct packed {
 /**
  * No WB output packet as it would be more cumbersome than useful
  */
+
+
+/**
+ * ROB Packet:
+ * 
+ */
+typedef struct packed {
+  logic              done;        // set by CDB later; 0 at dispatch
+  logic              dest_valid;
+  logic [4:0]        rd;
+  logic [`TAG_W-1:0] tag;
+  logic [`TAG_W-1:0] told;
+} ROB_PACKET;
+
+
 
 `endif  // __SYS_DEFS_SVH__

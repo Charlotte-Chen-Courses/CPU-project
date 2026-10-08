@@ -20,7 +20,7 @@
 `include "verilog/sys_defs.svh"
 
 module rat #(
-    localparam TAG_W = $clog2(`PHYS_REG_SZ),
+    localparam TAG_W = `TAG_W,
     localparam W = `SUPERSCALAR_WIDTH,
     localparam RAT_SZ = `ARCH_REG_SZ
 ) (
