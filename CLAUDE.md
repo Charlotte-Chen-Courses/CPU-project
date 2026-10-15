@@ -19,7 +19,8 @@ microarchitectural depth per unit of finished, working, defensible work* — not
 grading rubric. A clean, measured, well-analyzed core beats a large broken one.
 The analysis IS the deliverable.
 
-- **Duration:** ~8 weeks, full-time, no other commitments
+- **Duration:** ~10 weeks, full-time, no other commitments (extended from 8 on
+  2026-10-11 to add the F and A extensions)
 
 ---
 
@@ -40,6 +41,9 @@ The analysis IS the deliverable.
   more than predictor sophistication.
 - **Non-blocking D-cache with MSHRs** — added only once the core is solid; pairs
   with the LSQ for a memory-level-parallelism analysis story.
+- **F extension: one floating-point functional unit** — a second register class
+  for rename and a second long/variable-latency FU class. See ISA scope.
+- **A extension (atomics)** — LR/SC + AMOs, executed through the LSQ.
 - **SMT (2-thread) — TERMINAL FEATURE.** See the SMT section below. It is
   deliberately scoped as cuttable.
 
@@ -50,7 +54,7 @@ core fully commits programs:
 - `NUM_THREADS` (start 1)
 
 Also parameterize: PRF size, ROB depth, IQ depth, LSQ depth, freelist size. These
-become the axes of the design-space exploration in Phase 5.
+become the axes of the design-space exploration in Phase 6.
 
 **Critical:** never build width or SMT into untested logic. Retrofitting width
 onto a scalar design is the classic way these projects collapse near the
@@ -61,38 +65,57 @@ immediately, even while tested at N=1.
 
 ## ISA scope
 
-- **Target: RV32IM.** Base integer + multiply/divide.
+- **Target: RV32IMAF.** Base integer + multiply/divide + atomics +
+  single-precision floating point. (Decision changed 2026-10-11: F and A were
+  previously excluded/terminal; the schedule was extended to 10 weeks for them.)
 - **M is included deliberately:** multiply is the canonical variable-latency
   functional unit that makes out-of-order execution interesting (exercises
   wakeup/select and CDB arbitration). Use the provided pipelined multiplier.
+- **F (single-precision FP), one FP functional unit:**
+  - Rename a second register class: FP RAT (f0–f31; note f0 is a real register,
+    unlike x0) + FP freelist + FP PRF, or a unified PRF with a register-class
+    bit. **Decide which before Phase 4 starts** and record it here.
+  - One FP FU: pipelined for add/sub/mul/fused multiply-add/convert/compare;
+    fdiv/fsqrt may be iterative (unpipelined) inside the same unit. FP results
+    share the same CDBs as integer results (CDB constraint below still holds).
+  - flw/fsw go through the LSQ like integer loads/stores.
+  - fcsr: support rounding mode + accumulate fflags at commit. No FP traps.
+  - **D (double) is still excluded.**
+  - Why it's worth it: a second rename class and a long-latency FU make the
+    wakeup/select, CDB-arbitration and register-pressure analysis richer.
+- **A (atomics):** LR/SC + AMOs (amoswap/amoadd/amoand/amoor/amoxor/amomin/
+  amomax[u]). Execute non-speculatively at the head of the LSQ/ROB; LR sets a
+  reservation that a conflicting store or SC clears. Single-thread it is mostly
+  a correctness feature; with SMT it gets a real target (two threads sharing
+  L1).
 - **Excluded, by deliberate scoping judgment** (being able to articulate WHY is
   itself an interview signal):
-  - **F/D (floating point):** adds datapath + a second register file + FP
-    exception work, but doesn't deepen the OoO/LSQ/SMT story. Skipped.
+  - **D (double-precision FP):** doubles FP datapath width for no new OoO
+    insight beyond F.
   - **C (compressed):** pure fetch/decode complexity in the stage SMT already
     stresses most. Skipped.
   - **Privileged/CSR/interrupts:** implement only enough exception plumbing for
-    the test harness + branch-misprediction recovery. No real M-mode / traps.
-- **If exactly one extension beyond M is ever added: A (atomics)** — and only
-  because SMT gives it a real target (two threads sharing L1). Narrow scope:
-  LR/SC + amoadd/amoswap. This is terminal-of-terminal; only if SMT AND LSQ are
-  both solid.
+    the test harness + branch-misprediction recovery (+ fcsr for F). No real
+    M-mode / traps.
 - **Before finalizing:** confirm what ISA subset the provided benchmark binaries
-  were compiled for (toolchain flags). IM is expected to match exactly.
+  were compiled for (toolchain flags). They were expected to be IM; F and A need
+  `-march=rv32imaf` builds and hand-written FP/atomic test programs, since the
+  existing benchmarks likely contain no FP or atomic instructions.
 
 ---
 
 ## CDB constraint (do not violate)
 
 Number of CDBs ≤ superscalar width. At 2-way, at most 2 CDBs. This is a hard
-architectural rule of the design.
+architectural rule of the design. The FP unit competes for the same CDBs; it
+does not get its own.
 
 ---
 
-## Roadmap (8 weeks) — with always-shippable checkpoints
+## Roadmap (10 weeks) — with always-shippable checkpoints
 
 The governing principle: **working scalar core first, then widen, then memory,
-then SMT.** Each checkpoint is a complete, presentable artifact. There are three
+then F + A, then SMT.** Each checkpoint is a complete, presentable artifact. There are three
 pre-planned fallback points so the project can never end with nothing.
 
 ### Phase 0 — Foundations (Week 1)
@@ -131,8 +154,22 @@ pre-planned fallback points so the project can never end with nothing.
   non-blocking cache) passing bulk of test programs. This is the "complete
   project" fallback.**
 
-### Phase 4 — SMT overlay (Week 7) — TERMINAL, CUTTABLE
+### Phase 4 — F + A extensions (Weeks 7–8)
 - Only start if Phase 3 is genuinely stable.
+- Week 7 — F: decode FP ops (extend the P3 decoder, don't rewrite it); FP
+  register class through rename (FP RAT/freelist/PRF or unified PRF — decision
+  recorded in ISA scope); one FP FU on the shared CDBs; flw/fsw through the LSQ;
+  fcsr rounding mode + fflags at commit. Hand-written FP tests + golden check
+  against Spike.
+- Week 8 — A: LR/SC + AMOs executed non-speculatively at the LSQ/ROB head;
+  reservation set/clear logic. Directed tests (LR/SC success + failure, each
+  AMO).
+- **★ Checkpoint: RV32IMAF single-thread core passing integer, FP and atomic
+  tests. This is the new "complete project" fallback; the Phase 3 core remains
+  the fallback beneath it.**
+
+### Phase 5 — SMT overlay (Week 9) — TERMINAL, CUTTABLE
+- Only start if Phase 4 is genuinely stable.
 - Thread-tag / duplicate architectural state: 2× RAT, 2× RAS, per-thread PC, ROB
   thread-ID + per-thread commit, per-thread isolated recovery.
 - Build a real fetch policy (**ICOUNT**, not round-robin) — where SMT's
@@ -142,13 +179,17 @@ pre-planned fallback points so the project can never end with nothing.
   since the benchmarks are single-threaded.
 - **Checkpoint:** two threads concurrent with isolated recovery;
   aggregate throughput measurable. **If buggy here, CUT IT and revert to the
-  Phase 3 core — this is the pre-planned escape hatch.**
+  Phase 4 core — this is the pre-planned escape hatch.**
+- With A in place, SMT also gets a real atomics workload (two threads
+  contending on shared data).
 
-### Phase 5 — Analysis, synthesis close, write-up (Week 8)
+### Phase 6 — Analysis, synthesis close, write-up (Week 10)
 This week is where the portfolio value is created; protect it last, never
 sacrifice it.
 - Design-space sweeps with plots: CPI vs ROB/IQ/LSQ depth, predictor table size,
   cache associativity/MSHR count — across multiple benchmarks.
+- F: IPC on FP-heavy kernels, FP-unit utilization, CDB contention between FP and
+  integer results.
 - SMT (if kept): aggregate throughput gain + per-thread slowdown vs single-thread.
   Report honestly, including negatives.
 - Synthesis: report clock period, find + discuss critical path (likely
@@ -158,10 +199,11 @@ sacrifice it.
 
 ### Risk rules
 - Most likely schedule-killer: Phase 1 or Phase 3 debug overrunning.
-- If either slips: **cut SMT first, then the non-blocking cache. Protect the
-  analysis week last.**
-- There is almost no slack. If a safer project is wanted, drop SMT now and make
-  the single-thread core excellent and deeply analyzed instead.
+- If anything slips: **cut SMT first, then A, then the non-blocking cache, then
+  F. Protect the analysis week last.**
+- There is almost no slack even at 10 weeks. If a safer project is wanted, drop
+  SMT now and make the single-thread RV32IMAF core excellent and deeply analyzed
+  instead.
 
 ---
 
