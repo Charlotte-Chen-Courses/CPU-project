@@ -22,6 +22,8 @@
 
 // superscalar width
 `define SUPERSCALAR_WIDTH 2
+// max instructions issued per cycle (RS -> PRF read); PRF has 2 read ports per issue slot
+`define ISSUE_WIDTH `SUPERSCALAR_WIDTH
 
 // sizes
 `define NUM_CDB 2
@@ -41,11 +43,44 @@
 `define LSQ_SZ xx
 
 // functional units (you should decide if you want more or fewer types of FUs)
-`define NUM_FU_ALU xx
-`define NUM_FU_MULT xx
-`define NUM_FU_LOAD xx
-`define NUM_FU_STORE xx
 
+typedef enum logic [2:0] {
+  FU_ALU,
+  FU_MULT,
+  FU_LOAD,
+  FU_STORE,
+  FU_FP
+} FU_TYPE;
+
+`define NUM_FU_ALU 1
+`define NUM_FU_MULT 0
+`define NUM_FU_LOAD 0
+`define NUM_FU_STORE 0
+`define NUM_FU_FP 0
+`define NUM_FU (`NUM_FU_ALU+`NUM_FU_MULT+`NUM_FU_LOAD+`NUM_FU_STORE+`NUM_FU_FP)
+
+// Ports (RS issue ports = FU instances = CDB-arbiter inputs) are grouped by FU type in
+// this order: ALU, MULT, LOAD, STORE, FP. Shared by rs.sv and cdb_arbiter.sv.
+function automatic FU_TYPE port_type(input int f);
+  if (f < `NUM_FU_ALU) return FU_ALU;
+  if (f < `NUM_FU_ALU + `NUM_FU_MULT) return FU_MULT;
+  if (f < `NUM_FU_ALU + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
+  if (f < `NUM_FU - `NUM_FU_FP) return FU_STORE;
+  return FU_FP;
+endfunction
+
+// Priority between FU types (RS issue when slots run out, CDB arbitration):
+// longest latency first. Rank 0 is served first.
+`define NUM_FU_RANKS 5
+function automatic FU_TYPE rank_type(input int r);
+  case (r)
+    0:       return FU_FP;
+    1:       return FU_MULT;
+    2:       return FU_LOAD;
+    3:       return FU_STORE;
+    default: return FU_ALU;
+  endcase
+endfunction
 // number of mult stages (2, 4, or 8)
 `define MULT_STAGES 4
 
@@ -375,6 +410,8 @@ typedef struct packed {
   logic [4:0]        rd;
   logic [`TAG_W-1:0] tag;
   logic [`TAG_W-1:0] told;
+  logic [`XLEN-1:0]  pc;          // commit trace / mispredict redirect
+  logic              halt;        // WFI: stop at commit
 } ROB_PACKET;
 
 
@@ -383,16 +420,37 @@ typedef struct packed {
  * 
  */
 typedef struct packed {
+  INST              inst;
+  logic [`XLEN-1:0] PC;
+  logic [`XLEN-1:0] NPC;   // PC + 4
+
   logic [`TAG_W-1:0]     src1_tag;
   logic                  src1_ready;
   logic [`TAG_W-1:0]     src2_tag;
   logic                  src2_ready;
   logic [`TAG_W-1:0]     dest_tag;
   logic [`ROB_IDX_W-1:0] rob_idx;
+  FU_TYPE                fu_type;
 
+
+  ALU_FUNC alu_func;  // ALU function select (ALU_xxx *)
+  ALU_OPA_SELECT opa_select;  // ALU opa mux select (ALU_OPA_xxx *)
+  ALU_OPB_SELECT opb_select;  // ALU opb mux select (ALU_OPB_xxx *)
   // TODO: other fields
 
 } RS_PACKET;
+
+
+/**
+ * CDB Packet:
+ * 
+ */
+typedef struct packed {
+  logic [`TAG_W-1:0]     tag;      // dest_tag (p0 = no destination)
+  logic [`XLEN-1:0]      value;
+  logic [`ROB_IDX_W-1:0] rob_idx;
+} CDB_PACKET;
+
 
 
 

@@ -13,10 +13,13 @@
 SRC   := starter
 BUILD := build
 
-TESTS := prf freelist rat rob
+TESTS := prf freelist rat rob rs busy_table alu_fu cdb_arbiter decoder retire_rat cpu
 
 # extra sources per module, e.g. DEPS_mult := $(SRC)/verilog/mult_stage.sv
 DEPS_prf :=
+# the whole core (cpu.sv is the top)
+DEPS_cpu := $(addprefix $(SRC)/verilog/, dispatch.sv decoder.sv freelist.sv rat.sv busy_table.sv \
+              rob.sv retire_rat.sv rs.sv prf.sv alu_fu.sv cdb_arbiter.sv)
 
 CLOCK_PERIOD ?= 10
 

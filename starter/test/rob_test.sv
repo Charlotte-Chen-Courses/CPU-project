@@ -28,6 +28,8 @@ module testbench;
     logic [W-1:0]            disp_valid, disp_dest_valid;
     logic [W-1:0][4:0]       disp_rd;
     logic [W-1:0][TAG_W-1:0] disp_tag, disp_told;
+    logic [W-1:0][`XLEN-1:0] disp_pc, commit_pc;
+    logic [W-1:0]            disp_halt, commit_halt;
     logic [W-1:0][PTR_W-1:0] disp_idx;
     logic                    space_ok;
     logic [C-1:0]            cdb_valid;
@@ -44,6 +46,8 @@ module testbench;
         .disp_rd          (disp_rd),
         .disp_tag         (disp_tag),
         .disp_told        (disp_told),
+        .disp_pc          (disp_pc),
+        .disp_halt        (disp_halt),
         .disp_idx         (disp_idx),
         .space_ok         (space_ok),
         .cdb_valid        (cdb_valid),
@@ -52,7 +56,9 @@ module testbench;
         .commit_dest_valid(commit_dest_valid),
         .commit_rd        (commit_rd),
         .commit_tag       (commit_tag),
-        .commit_told      (commit_told)
+        .commit_told      (commit_told),
+        .commit_pc        (commit_pc),
+        .commit_halt      (commit_halt)
     );
 
     always #5 clock = ~clock;
@@ -63,6 +69,8 @@ module testbench;
         bit         dest_valid;
         logic [4:0] rd;
         logic [TAG_W-1:0] tag, told;
+        logic [`XLEN-1:0] pc;
+        bit         halt;
     } entry_t;
 
     entry_t m [SZ];
@@ -81,6 +89,7 @@ module testbench;
 
     task automatic idle();
         disp_valid = '0; disp_dest_valid = '0; disp_rd = '0; disp_tag = '0; disp_told = '0;
+        disp_pc = '0; disp_halt = '0;
         cdb_valid = '0; cdb_rob_idx = '0;
     endtask
 
@@ -91,6 +100,8 @@ module testbench;
         disp_rd[i]         = 5'($urandom_range(1, 31));
         disp_tag[i]        = TAG_W'($urandom);
         disp_told[i]       = TAG_W'($urandom);
+        disp_pc[i]         = $urandom;
+        disp_halt[i]       = 0;
     endtask
 
     // ROB index of the k-th oldest in-flight entry
@@ -115,9 +126,13 @@ module testbench;
             n_disp += int'(disp_valid[i]);
         end
 
-        // expected commits: consecutive done entries from the head, up to W
+        // expected commits: consecutive done entries from the head, up to W,
+        // and nothing younger than a halt in the same cycle
         for (int i = 0; i < W; i++) begin
-            automatic bit exp = (n_com == i) && (i < m_count) && m[nth(i)].done;
+            automatic bit halt_before = 0;
+            automatic bit exp;
+            for (int j = 0; j < i; j++) if (commit_valid[j] && m[nth(j)].halt) halt_before = 1;
+            exp = (n_com == i) && (i < m_count) && m[nth(i)].done && !halt_before;
             if (commit_valid[i] !== exp)
                 fail($sformatf("[%s] slot %0d commit_valid=%b expected %b (count=%0d)",
                                what, i, commit_valid[i], exp, m_count));
@@ -129,6 +144,10 @@ module testbench;
                     fail($sformatf("[%s] slot %0d rob %0d: got rd=%0d tag=%0d told=%0d, expected rd=%0d tag=%0d told=%0d",
                                    what, i, idx, commit_rd[i], commit_tag[i], commit_told[i],
                                    m[idx].rd, m[idx].tag, m[idx].told));
+                if (commit_pc[i] !== m[idx].pc)
+                    fail($sformatf("[%s] slot %0d rob %0d: commit_pc=%h expected %h", what, i, idx, commit_pc[i], m[idx].pc));
+                if (commit_halt[i] !== m[idx].halt)
+                    fail($sformatf("[%s] slot %0d rob %0d: commit_halt=%b expected %b", what, i, idx, commit_halt[i], m[idx].halt));
                 n_com++;
             end
         end
@@ -141,7 +160,7 @@ module testbench;
             if (disp_valid[i]) begin
                 idx = (m_tail + n_disp) % SZ;
                 m[idx] = '{done: 0, dest_valid: disp_dest_valid[i], rd: disp_rd[i],
-                           tag: disp_tag[i], told: disp_told[i]};
+                           tag: disp_tag[i], told: disp_told[i], pc: disp_pc[i], halt: disp_halt[i]};
                 n_disp++;
             end
         m_tail  = (m_tail + n_disp) % SZ;
@@ -257,14 +276,26 @@ module testbench;
         step("dispatch store");
         drain("drain store");
 
-        // 9) random traffic: random dispatch, random out-of-order completion, many wraps
-        $display("Test 9: 20000 random cycles");
+        // 9) halt: an entry younger than a halt must not commit in the same cycle
+        if (W >= 2) begin
+            $display("Test 9: nothing commits after a halt in the same cycle");
+            idle(); disp(0, 0); disp_halt[0] = 1; disp(1);
+            step("dispatch halt + younger");
+            idle(); complete(0, 0); if (C > 1) complete(1, 1);
+            step("complete both");
+            idle(); if (C == 1) complete(0, 1);
+            step("halt commits alone");
+            drain("drain after halt");
+        end
+
+        // 10) random traffic: random dispatch, random out-of-order completion, many wraps
+        $display("Test 10: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
             automatic int not_done[$];
             idle();
             if (space_ok)
                 for (int i = 0; i < W; i++)
-                    if ($urandom % 3 != 0) disp(i, ($urandom % 4) != 0);
+                    if ($urandom % 3 != 0) begin disp(i, ($urandom % 4) != 0); disp_halt[i] = ($urandom % 16 == 0); end
             for (int k = 0; k < m_count; k++) if (!m[nth(k)].done) not_done.push_back(k);
             not_done.shuffle();
             for (int p = 0; p < C && p < not_done.size(); p++)

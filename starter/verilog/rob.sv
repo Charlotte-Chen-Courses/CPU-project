@@ -15,6 +15,9 @@
 //                 not done; the count check keeps stale done bits in  //
 //                 empty entries from committing. Commit outputs feed  //
 //                 the freelist (told) and retirement RAT (rd, tag).   //
+//                 Each entry also keeps its PC (commit trace) and a   //
+//                 halt bit: nothing younger than a committing halt    //
+//                 commits in the same cycle (commit_halt).            //
 //                 No flush / mispredict recovery yet.                 //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
@@ -36,6 +39,8 @@ module rob #(
     input [W-1:0][4:0] disp_rd,
     input [W-1:0][TAG_W-1:0] disp_tag,  // from freelist alloc_tag
     input [W-1:0][TAG_W-1:0] disp_told,  // from RAT told
+    input [W-1:0][`XLEN-1:0] disp_pc,
+    input [W-1:0] disp_halt,  // WFI
     output logic [W-1:0][PTR_W-1:0] disp_idx,   // ROB index handed to each slot → RS → FU → CDB
     output logic space_ok,  // ≥ W free entries; must NOT depend on disp_valid
 
@@ -49,29 +54,37 @@ module rob #(
     output logic [W-1:0]            commit_dest_valid,
     output logic [W-1:0][      4:0] commit_rd,
     output logic [W-1:0][TAG_W-1:0] commit_tag,
-    commit_told
+    commit_told,
+    output logic [W-1:0][`XLEN-1:0] commit_pc,
+    output logic [W-1:0] commit_halt  // this slot commits a halt; no younger slot commits
 );
   ROB_PACKET rob_map[ROB_SZ];
   logic [PTR_W-1:0] head_ptr, tail_ptr, commit_idx;
 
   logic [$clog2(ROB_SZ+1)-1:0] rob_count;
   int n_disp, n_commit;
+  logic halt_seen;  // an older slot in this cycle's commit group is a halt
 
 
   // ---- combinational: this cycle's outputs ----
   always_comb begin
-    n_disp   = 0;
-    n_commit = 0;
+    n_disp    = 0;
+    n_commit  = 0;
+    halt_seen = `FALSE;
     for (int i = 0; i < W; i++) begin
       disp_idx[i] = PTR_W'((int'(tail_ptr) + n_disp) % ROB_SZ);
       commit_idx = PTR_W'((int'(head_ptr) + i) % ROB_SZ);
       commit_valid[i] = (n_commit == i)  // all older slots committed
       && (i < int'(rob_count))  // entry is occupied
-      && rob_map[commit_idx].done;
+      && rob_map[commit_idx].done
+      && !halt_seen;  // nothing commits after a halt
       commit_dest_valid[i] = commit_valid[i] && rob_map[commit_idx].dest_valid;
       commit_rd[i] = rob_map[commit_idx].rd;
       commit_tag[i] = rob_map[commit_idx].tag;
       commit_told[i] = rob_map[commit_idx].told;
+      commit_pc[i] = rob_map[commit_idx].pc;
+      commit_halt[i] = commit_valid[i] && rob_map[commit_idx].halt;
+      halt_seen = halt_seen || commit_halt[i];
       n_disp += int'(disp_valid[i]);
       n_commit += int'(commit_valid[i]);
     end
@@ -93,7 +106,9 @@ module rob #(
             dest_valid: disp_dest_valid[i],
             rd: disp_rd[i],
             tag: disp_tag[i],
-            told: disp_told[i]
+            told: disp_told[i],
+            pc: disp_pc[i],
+            halt: disp_halt[i]
         };
       head_ptr  <= PTR_W'((int'(head_ptr) + n_commit) % ROB_SZ);
       tail_ptr  <= PTR_W'((int'(tail_ptr) + n_disp) % ROB_SZ);

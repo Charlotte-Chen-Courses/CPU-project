@@ -3,19 +3,21 @@
 //   Modulename :  prf.sv                                              //
 //                                                                     //
 //  Description :  Physical register file (PRF) for the R10K-style     //
-//                 core. Indexed by physical register tag. Read at     //
-//                 issue (2 ports per issue slot), written on the      //
-//                 CDB (1 port per CDB). Physical reg 0 is hardwired   //
-//                 to zero and backs architectural x0. Same-cycle      //
-//                 CDB writes are bypassed to the read ports.          //
+//                 core. Indexed by physical register tag. Read after  //
+//                 issue: 2 ports per issue slot (ISSUE_WIDTH slots,   //
+//                 the RS issues at most that many per cycle). Written //
+//                 on the CDB (1 port per CDB). Physical reg 0 is      //
+//                 hardwired to zero and backs architectural x0.       //
+//                 Same-cycle CDB writes are bypassed to the read      //
+//                 ports.                                              //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
 `include "verilog/sys_defs.svh"
 
 module prf #(
-    parameter  RD_SZ = 2 * `SUPERSCALAR_WIDTH,
-    parameter  WR_SZ = `NUM_CDB,
+    localparam RD_SZ = 2 * `ISSUE_WIDTH,  // 2 operands per issue slot
+    localparam WR_SZ = `NUM_CDB,
     localparam TAG_W = `TAG_W
 ) (
     input                               clock,    // system clock

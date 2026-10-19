@@ -1,0 +1,213 @@
+/////////////////////////////////////////////////////////////////////////
+//                                                                     //
+//   Modulename :  dispatch.sv                                         //
+//                                                                     //
+//  Description :  Decode + rename + dispatch for one fetch bundle.    //
+//                 Contains the decoders, freelist, speculative RAT    //
+//                 and busy table, and produces the ROB and RS entries //
+//                 for the bundle. Rules:                              //
+//                  - fire = any valid && freelist can_alloc_w &&      //
+//                    rob_space_ok && rs_space_ok. All three are       //
+//                    state-only (never the request-dependent          //
+//                    alloc_ok), so there is no combinational loop.    //
+//                    The bundle renames whole or not at all.          //
+//                  - dest_valid = valid && has_dest && rd != x0.      //
+//                  - freelist alloc_req, busy-table set_en, RAT       //
+//                    writes and ROB/RS writes happen only on fire.    //
+//                  - src ready = busy table ready (with CDB bypass)   //
+//                    && not bypassed from an older slot in the        //
+//                    bundle (that value does not exist yet).          //
+//                  - RS dest_tag = dest_valid ? new tag : p0.         //
+//                  - slots younger than a WFI in the bundle are       //
+//                    dropped (never enter the ROB).                   //
+//                 First-slice restriction: only integer ALU ops and   //
+//                 WFI may dispatch (simulation assertion below).      //
+//                                                                     //
+/////////////////////////////////////////////////////////////////////////
+
+`include "verilog/sys_defs.svh"
+
+module dispatch #(
+    localparam W         = `SUPERSCALAR_WIDTH,
+    localparam TAG_W     = `TAG_W,
+    localparam ROB_IDX_W = `ROB_IDX_W,
+    localparam CDB_SZ    = `NUM_CDB
+) (
+    input clock,
+    input reset,
+
+    // fetch bundle
+    input        [W-1:0]                  in_valid,
+    input  INST  [W-1:0]                  in_inst,
+    input        [W-1:0][`XLEN-1:0]       in_pc,
+    output logic                          fire,          // bundle accepted: fetch may advance
+
+    // back-pressure (state-only signals from the ROB and RS)
+    input                                 rob_space_ok,
+    input                                 rs_space_ok,
+    input        [W-1:0][ROB_IDX_W-1:0]   rob_idx,       // ROB entry each slot lands in
+
+    // to the ROB
+    output logic [W-1:0]                  disp_valid,
+    output logic [W-1:0]                  disp_dest_valid,
+    output logic [W-1:0][4:0]             disp_rd,
+    output logic [W-1:0][TAG_W-1:0]       disp_tag,
+    output logic [W-1:0][TAG_W-1:0]       disp_told,
+    output logic [W-1:0][`XLEN-1:0]       disp_pc,
+    output logic [W-1:0]                  disp_halt,
+
+    // to the RS (slot i is valid when disp_valid[i])
+    output RS_PACKET [W-1:0]              disp_pkt,
+
+    // CDB: clears busy bits
+    input        [CDB_SZ-1:0]             cdb_valid,
+    input        [CDB_SZ-1:0][TAG_W-1:0]  cdb_tag,
+
+    // commit: frees old physical registers
+    input        [W-1:0]                  free_en,
+    input        [W-1:0][TAG_W-1:0]       free_tag
+);
+
+  // ---- decode ----
+  ALU_OPA_SELECT [W-1:0] opa_select;
+  ALU_OPB_SELECT [W-1:0] opb_select;
+  ALU_FUNC       [W-1:0] alu_func;
+  FU_TYPE        [W-1:0] fu_type;
+  logic [W-1:0] has_dest, rd_mem, wr_mem, cond_branch, uncond_branch, csr_op, halt, illegal;
+  logic [W-1:0] rs1_fp, rs2_fp, rd_fp, rs3_used, atomic;
+
+  logic [W-1:0][4:0] rs1, rs2, rd;
+
+  genvar g;
+  for (g = 0; g < W; g++) begin : gen_decode
+    decoder decoder_0 (
+        .inst         (in_inst[g]),
+        .valid        (in_valid[g]),
+        .opa_select   (opa_select[g]),
+        .opb_select   (opb_select[g]),
+        .has_dest     (has_dest[g]),
+        .alu_func     (alu_func[g]),
+        .rd_mem       (rd_mem[g]),
+        .wr_mem       (wr_mem[g]),
+        .cond_branch  (cond_branch[g]),
+        .uncond_branch(uncond_branch[g]),
+        .csr_op       (csr_op[g]),
+        .halt         (halt[g]),
+        .illegal      (illegal[g]),
+        .fu_type      (fu_type[g]),
+        .rs1_fp       (rs1_fp[g]),
+        .rs2_fp       (rs2_fp[g]),
+        .rd_fp        (rd_fp[g]),
+        .rs3_used     (rs3_used[g]),
+        .atomic       (atomic[g])
+    );
+    assign rs1[g] = in_inst[g][19:15];
+    assign rs2[g] = in_inst[g][24:20];
+    assign rd[g]  = in_inst[g][11:7];
+  end
+
+  // ---- slots after a WFI in the same bundle are dropped: nothing past a halt enters the ROB ----
+  logic [W-1:0] slot_valid;
+  always_comb
+    for (int i = 0; i < W; i++) begin
+      slot_valid[i] = in_valid[i];
+      for (int j = 0; j < i; j++) if (in_valid[j] && halt[j]) slot_valid[i] = `FALSE;
+    end
+
+  // ---- rename control ----
+  logic             can_alloc_w;
+  logic [W-1:0]     dest_valid;
+  logic [W-1:0][TAG_W-1:0] new_tag, src1_tag, src2_tag, told;
+  logic [W-1:0]     src1_bypassed, src2_bypassed, src1_free, src2_free;
+
+  assign fire = (|slot_valid) && can_alloc_w && rob_space_ok && rs_space_ok;
+
+  always_comb
+    for (int i = 0; i < W; i++) dest_valid[i] = slot_valid[i] && has_dest[i] && (rd[i] != '0);
+
+  freelist freelist_0 (
+      .clock      (clock),
+      .reset      (reset),
+      .alloc_req  (dest_valid & {W{fire}}),
+      .alloc_tag  (new_tag),
+      /* verilator lint_off PINCONNECTEMPTY */
+      .alloc_ok   (),                  // request-dependent: deliberately unused (see fire)
+      /* verilator lint_on PINCONNECTEMPTY */
+      .can_alloc_w(can_alloc_w),
+      .free_en    (free_en),
+      .free_tag   (free_tag)
+  );
+
+  rat rat_0 (
+      .clock        (clock),
+      .reset        (reset),
+      .rename_en    (fire),
+      .valid        (slot_valid),
+      .rs1          (rs1),
+      .rs2          (rs2),
+      .rd           (rd),
+      .has_dest     (has_dest),
+      .new_tag      (new_tag),
+      .src1_tag     (src1_tag),
+      .src2_tag     (src2_tag),
+      .told         (told),
+      .src1_bypassed(src1_bypassed),
+      .src2_bypassed(src2_bypassed)
+  );
+
+  busy_table busy_table_0 (
+      .clock     (clock),
+      .reset     (reset),
+      .set_en    (dest_valid & {W{fire}}),
+      .set_tag   (new_tag),
+      .cdb_valid (cdb_valid),
+      .cdb_tag   (cdb_tag),
+      .src1_tag  (src1_tag),
+      .src2_tag  (src2_tag),
+      .src1_ready(src1_free),
+      .src2_ready(src2_free)
+  );
+
+  // ---- ROB and RS entries ----
+  always_comb begin
+    for (int i = 0; i < W; i++) begin
+      disp_valid[i]      = slot_valid[i] && fire;
+      disp_dest_valid[i] = dest_valid[i];
+      disp_rd[i]         = rd[i];
+      disp_tag[i]        = new_tag[i];
+      disp_told[i]       = told[i];
+      disp_pc[i]         = in_pc[i];
+      disp_halt[i]       = halt[i];
+
+      disp_pkt[i]            = '0;
+      disp_pkt[i].inst       = in_inst[i];
+      disp_pkt[i].PC         = in_pc[i];
+      disp_pkt[i].NPC        = in_pc[i] + 4;
+      disp_pkt[i].src1_tag   = src1_tag[i];
+      disp_pkt[i].src1_ready = src1_free[i] && !src1_bypassed[i];
+      disp_pkt[i].src2_tag   = src2_tag[i];
+      disp_pkt[i].src2_ready = src2_free[i] && !src2_bypassed[i];
+      disp_pkt[i].dest_tag   = dest_valid[i] ? new_tag[i] : '0;
+      disp_pkt[i].rob_idx    = rob_idx[i];
+      disp_pkt[i].fu_type    = fu_type[i];
+      disp_pkt[i].alu_func   = alu_func[i];
+      disp_pkt[i].opa_select = opa_select[i];
+      disp_pkt[i].opb_select = opb_select[i];
+    end
+  end
+
+  // ---- first-slice restriction: fail loudly on anything the core cannot run yet ----
+  // (branches/jumps would silently write their target to rd; loads/stores/mult/FP have
+  //  no FU port and would sit in the RS forever)
+  // synopsys translate_off
+  always_ff @(posedge clock)
+    if (!reset)
+      for (int i = 0; i < W; i++)
+        if (disp_valid[i])
+          assert (!illegal[i] && fu_type[i] == FU_ALU && !cond_branch[i] && !uncond_branch[i] &&
+                  !rd_mem[i] && !wr_mem[i] && !csr_op[i] && !atomic[i] &&
+                  !rs1_fp[i] && !rs2_fp[i] && !rd_fp[i] && !rs3_used[i])
+          else $error("dispatch: unsupported instruction %h at PC %h (slot %0d)", in_inst[i], in_pc[i], i);
+  // synopsys translate_on
+
+endmodule  // dispatch

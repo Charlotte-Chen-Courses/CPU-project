@@ -1,5 +1,22 @@
-
-// The decoder, copied from p3/stage_id.sv without changes
+/////////////////////////////////////////////////////////////////////////
+//                                                                     //
+//   Modulename :  decoder.sv                                          //
+//                                                                     //
+//  Description :  Instruction decoder, from the P3 stage_id.sv,       //
+//                 extended for RV32IMAF. The original P3 outputs and  //
+//                 their behaviour for P3 instructions are unchanged.  //
+//                 Added: fu_type (which functional unit), register    //
+//                 class per operand (rs1_fp/rs2_fp/rd_fp), rs3_used   //
+//                 (fused multiply-add), atomic (LR/SC/AMO); and       //
+//                 decode for div/rem, FENCE/FENCE.I (no-ops), the     //
+//                 CSR immediate forms, A, and F. FP ops are only      //
+//                 classified here; the FP unit decodes the exact op   //
+//                 from inst. Reserved rounding modes (101, 110) on    //
+//                 FP ops are illegal.                                 //
+//                 Note: f0 is a real register, so "rd != 0" must only //
+//                 suppress renaming when !rd_fp.                      //
+//                                                                     //
+/////////////////////////////////////////////////////////////////////////
 
 `include "verilog/sys_defs.svh"
 `include "verilog/ISA.svh"
@@ -17,8 +34,20 @@ module decoder (
     output logic          rd_mem, wr_mem, cond_branch, uncond_branch,
     output logic          csr_op, // used for CSR operations, we only use this as a cheap way to get the return code out
     output logic          halt,   // non-zero on a halt
-    output logic          illegal // non-zero on an illegal instruction
+    output logic          illegal, // non-zero on an illegal instruction
+
+    // added for the OoO core / RV32IMAF
+    output FU_TYPE        fu_type,  // functional unit that executes it
+    output logic          rs1_fp,   // 1: rs1 is an f-register (F extension)
+    output logic          rs2_fp,   // 1: rs2 is an f-register
+    output logic          rd_fp,    // 1: rd is an f-register
+    output logic          rs3_used, // fused multiply-add: third FP source rs3 = inst[31:27]
+    output logic          atomic    // LR/SC/AMO (A extension)
 );
+
+    // rounding mode field of FP ops: 101 and 110 are reserved
+    logic bad_rm;
+    assign bad_rm = (inst[14:12] == 3'b101) || (inst[14:12] == 3'b110);
 
     // Note: I recommend using an IDE's code folding feature on this block
     always_comb begin
@@ -35,6 +64,12 @@ module decoder (
         uncond_branch = `FALSE;
         halt          = `FALSE;
         illegal       = `FALSE;
+        fu_type       = FU_ALU;
+        rs1_fp        = `FALSE;
+        rs2_fp        = `FALSE;
+        rd_fp         = `FALSE;
+        rs3_used      = `FALSE;
+        atomic        = `FALSE;
 
         if (valid) begin
             casez (inst)
@@ -71,10 +106,12 @@ module decoder (
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
                     rd_mem     = `TRUE;
+                    fu_type    = FU_LOAD;
                 end
                 `RV32_SB, `RV32_SH, `RV32_SW: begin
                     opb_select = OPB_IS_S_IMM;
                     wr_mem     = `TRUE;
+                    fu_type    = FU_STORE;
                 end
                 `RV32_ADDI: begin
                     has_dest   = `TRUE;
@@ -162,25 +199,151 @@ module decoder (
                 `RV32_MUL: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_MUL;
+                    fu_type    = FU_MULT;
                 end
                 `RV32_MULH: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_MULH;
+                    fu_type    = FU_MULT;
                 end
                 `RV32_MULHSU: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_MULHSU;
+                    fu_type    = FU_MULT;
                 end
                 `RV32_MULHU: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_MULHU;
+                    fu_type    = FU_MULT;
                 end
-                `RV32_CSRRW, `RV32_CSRRS, `RV32_CSRRC: begin
+                // M: divide/remainder (needs a divider in the MULT/M unit)
+                `RV32_DIV: begin
+                    has_dest   = `TRUE;
+                    alu_func   = ALU_DIV;
+                    fu_type    = FU_MULT;
+                end
+                `RV32_DIVU: begin
+                    has_dest   = `TRUE;
+                    alu_func   = ALU_DIVU;
+                    fu_type    = FU_MULT;
+                end
+                `RV32_REM: begin
+                    has_dest   = `TRUE;
+                    alu_func   = ALU_REM;
+                    fu_type    = FU_MULT;
+                end
+                `RV32_REMU: begin
+                    has_dest   = `TRUE;
+                    alu_func   = ALU_REMU;
+                    fu_type    = FU_MULT;
+                end
+                // single core, no self-modifying code: FENCE / FENCE.I act as no-ops
+                `RV32_FENCE_, `RV32_FENCE_I: begin
+                end
+                `RV32_CSRRW, `RV32_CSRRS, `RV32_CSRRC,
+                `RV32_CSRRWI, `RV32_CSRRSI, `RV32_CSRRCI: begin
                     csr_op = `TRUE;
                 end
                 `WFI: begin
                     halt = `TRUE;
                 end
+
+                // ---- A: atomics (execute through the LSQ) ----
+                `RV32_LR_W: begin
+                    has_dest   = `TRUE;
+                    rd_mem     = `TRUE;
+                    atomic     = `TRUE;
+                    fu_type    = FU_LOAD;
+                end
+                `RV32_SC_W: begin
+                    has_dest   = `TRUE;       // rd = 0 on success, 1 on failure
+                    wr_mem     = `TRUE;
+                    atomic     = `TRUE;
+                    fu_type    = FU_STORE;
+                end
+                `RV32_AMOSWAP_W, `RV32_AMOADD_W, `RV32_AMOXOR_W, `RV32_AMOAND_W,
+                `RV32_AMOOR_W, `RV32_AMOMIN_W, `RV32_AMOMAX_W,
+                `RV32_AMOMINU_W, `RV32_AMOMAXU_W: begin
+                    has_dest   = `TRUE;       // rd = old memory value
+                    rd_mem     = `TRUE;
+                    wr_mem     = `TRUE;
+                    atomic     = `TRUE;
+                    fu_type    = FU_STORE;
+                end
+
+                // ---- F: memory ----
+                `RV32_FLW: begin
+                    has_dest   = `TRUE;
+                    rd_fp      = `TRUE;
+                    opb_select = OPB_IS_I_IMM;
+                    rd_mem     = `TRUE;
+                    fu_type    = FU_LOAD;
+                end
+                `RV32_FSW: begin
+                    rs2_fp     = `TRUE;
+                    opb_select = OPB_IS_S_IMM;
+                    wr_mem     = `TRUE;
+                    fu_type    = FU_STORE;
+                end
+
+                // ---- F: FP sources, FP result ----
+                `RV32_FADD_S, `RV32_FSUB_S, `RV32_FMUL_S, `RV32_FDIV_S: begin
+                    has_dest = `TRUE;
+                    {rs1_fp, rs2_fp, rd_fp} = 3'b111;
+                    fu_type  = FU_FP;
+                    illegal  = bad_rm;
+                end
+                `RV32_FSQRT_S: begin
+                    has_dest = `TRUE;
+                    {rs1_fp, rd_fp} = 2'b11;
+                    fu_type  = FU_FP;
+                    illegal  = bad_rm;
+                end
+                `RV32_FSGNJ_S, `RV32_FSGNJN_S, `RV32_FSGNJX_S,
+                `RV32_FMIN_S, `RV32_FMAX_S: begin
+                    has_dest = `TRUE;
+                    {rs1_fp, rs2_fp, rd_fp} = 3'b111;
+                    fu_type  = FU_FP;
+                end
+                `RV32_FMADD_S, `RV32_FMSUB_S, `RV32_FNMSUB_S, `RV32_FNMADD_S: begin
+                    has_dest = `TRUE;
+                    {rs1_fp, rs2_fp, rd_fp} = 3'b111;
+                    rs3_used = `TRUE;
+                    fu_type  = FU_FP;
+                    illegal  = bad_rm;
+                end
+
+                // ---- F: FP sources, integer result ----
+                `RV32_FEQ_S, `RV32_FLT_S, `RV32_FLE_S: begin
+                    has_dest = `TRUE;
+                    {rs1_fp, rs2_fp} = 2'b11;
+                    fu_type  = FU_FP;
+                end
+                `RV32_FCLASS_S, `RV32_FMV_X_W: begin
+                    has_dest = `TRUE;
+                    rs1_fp   = `TRUE;
+                    fu_type  = FU_FP;
+                end
+                `RV32_FCVT_W_S, `RV32_FCVT_WU_S: begin
+                    has_dest = `TRUE;
+                    rs1_fp   = `TRUE;
+                    fu_type  = FU_FP;
+                    illegal  = bad_rm;
+                end
+
+                // ---- F: integer source, FP result ----
+                `RV32_FMV_W_X: begin
+                    has_dest = `TRUE;
+                    rd_fp    = `TRUE;
+                    fu_type  = FU_FP;
+                end
+                `RV32_FCVT_S_W, `RV32_FCVT_S_WU: begin
+                    has_dest = `TRUE;
+                    rd_fp    = `TRUE;
+                    fu_type  = FU_FP;
+                    illegal  = bad_rm;
+                end
+
                 default: begin
                     illegal = `TRUE;
                 end

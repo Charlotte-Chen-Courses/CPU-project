@@ -3,8 +3,8 @@
 //   Modulename :  freelist.sv                                         //
 //                                                                     //
 //  Description :  Free list of physical register tags for rename.     //
-//                 Circular FIFO of FREE_LIST_SZ (= PHYS_REG_SZ - 32)  //
-//                 tags. Resets full with pregs 32..PHYS_REG_SZ-1      //
+//                 Circular FIFO of FREE_LIST_SZ (PHYS - ARCH_REG_SZ)  //
+//                 tags. Resets full with pregs ARCH_REG_SZ..PHYS-1    //
 //                 (pregs 0..31 hold the initial arch state; preg 0    //
 //                 is never on the list). Allocates up to WIDTH tags   //
 //                 per cycle at rename; frees up to WIDTH old pregs    //
@@ -27,7 +27,8 @@ module freelist #(
     input reset,
     input [W-1:0] alloc_req,  // slot i needs a dest preg
     output logic [W-1:0][TAG_W-1:0] alloc_tag,  // valid only if alloc_ok && alloc_req[i]
-    output logic alloc_ok,  // enough free for all requests
+    output logic alloc_ok,  // enough free for all requests (depends on alloc_req)
+    output logic can_alloc_w,  // >= W tags free; state only -> use this for rename_fire
     input [W-1:0] free_en,  // slot i commits with an old preg
     input [W-1:0][TAG_W-1:0] free_tag  // old preg from committing ROB entry
 );
@@ -55,6 +56,7 @@ module freelist #(
   end
 
   assign alloc_ok = (int'(free_count) >= n_alloc);
+  assign can_alloc_w = (int'(free_count) >= W);
 
   // ---- sequential: next cycle's state ----
   always_ff @(posedge clock) begin

@@ -37,8 +37,11 @@ module rat #(
     input [W-1:0][TAG_W-1:0] new_tag,
     output logic [W-1:0][TAG_W-1:0] src1_tag,
     src2_tag,
-    told
-
+    told,
+    // source tag came from an older slot in this bundle (that value is not produced
+    // yet, so the source must start NOT ready even though the busy bit is still clear)
+    output logic [W-1:0] src1_bypassed,
+    src2_bypassed
 
 );
 
@@ -53,9 +56,11 @@ module rat #(
       src1_tag[i] = map[rs1[i]];
       src2_tag[i] = map[rs2[i]];
       told[i]     = map[rd[i]];
+      src1_bypassed[i] = `FALSE;
+      src2_bypassed[i] = `FALSE;
       for (int j = 0; j < i; j++) begin
-        if (dest_valid[j] && rd[j] == rs1[i]) src1_tag[i] = new_tag[j];
-        if (dest_valid[j] && rd[j] == rs2[i]) src2_tag[i] = new_tag[j];
+        if (dest_valid[j] && rd[j] == rs1[i]) begin src1_tag[i] = new_tag[j]; src1_bypassed[i] = `TRUE; end
+        if (dest_valid[j] && rd[j] == rs2[i]) begin src2_tag[i] = new_tag[j]; src2_bypassed[i] = `TRUE; end
         if (dest_valid[j] && rd[j] == rd[i]) told[i] = new_tag[j];
       end
     end

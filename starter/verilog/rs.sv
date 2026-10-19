@@ -1,3 +1,24 @@
+/////////////////////////////////////////////////////////////////////////
+//                                                                     //
+//   Modulename :  rs.sv                                               //
+//                                                                     //
+//  Description :  Reservation station (unified issue queue).          //
+//                 Dispatch: up to WIDTH packets into any free entries //
+//                 (first-free search; space_ok = room for a full      //
+//                 bundle, from state only). Wakeup: every CDB tag is  //
+//                 compared with both source tags of every valid       //
+//                 entry; a packet dispatched while its source is on   //
+//                 the CDB arrives ready (same-cycle bypass).          //
+//                 Issue: per FU port, lowest-index ready entry of     //
+//                 that FU type, at most ISSUE_WIDTH per cycle in      //
+//                 total; FU types served longest latency first        //
+//                 (rank_type in sys_defs). fu_ready backpressures a   //
+//                 port. Issued entries free at the clock edge.        //
+//                 Known: lowest-index select can starve high slots.   //
+//                 No flush yet.                                       //
+//                                                                     //
+/////////////////////////////////////////////////////////////////////////
+
 `include "verilog/sys_defs.svh"
 
 module rs #(
@@ -5,7 +26,9 @@ module rs #(
     localparam RS_SZ = `RS_SZ,
     localparam CDB_SZ = `NUM_CDB,
     localparam PTR_W = `RS_IDX_W,
-    localparam TAG_W = `TAG_W
+    localparam TAG_W = `TAG_W,
+    localparam NUM_FU = `NUM_FU,
+    localparam ISSUE_W = `ISSUE_WIDTH
 ) (
     input                    clock,
     input                    reset,
@@ -19,7 +42,10 @@ module rs #(
     input [CDB_SZ-1:0][TAG_W-1:0] cdb_tag,
 
     // issue
-    
+    input [NUM_FU-1:0] fu_ready,
+    output logic [NUM_FU-1:0] issue_valid,
+    output RS_PACKET [NUM_FU-1:0] issue_pkt
+
 );
 
   RS_PACKET rs_map[RS_SZ];
@@ -30,6 +56,18 @@ module rs #(
   // dispatch
   logic [W-1:0][PTR_W-1:0] alloc_idx;
   logic [W-1:0] alloc_found;
+
+  // issue
+  logic [RS_SZ-1:0] ready, granted;
+  logic [`NUM_FU-1:0][PTR_W-1:0] grant_idx;
+
+
+
+  // issue priority between FU types when ISSUE_W slots run out: longest latency first
+  // (same order as the CDB arbiter), so long operations start early and a steady
+  // stream of ALU work cannot starve the multiplier / FP unit
+
+  int n_issue;  // issue slots used so far this cycle
 
   always_comb begin
     taken = rs_valid;
@@ -60,6 +98,29 @@ module rs #(
     end
   end
 
+  // issue search
+  always_comb begin
+    for (int e = 0; e < RS_SZ; e++)
+    ready[e] = rs_valid[e] && rs_map[e].src1_ready && rs_map[e].src2_ready;
+
+    granted     = '0;
+    issue_valid = '0;
+    grant_idx   = '0;
+    n_issue     = 0;
+    // ports visited by FU-type rank, then port number; at most ISSUE_W grants in total
+    for (int r = 0; r < `NUM_FU_RANKS; r++)
+      for (int f = 0; f < `NUM_FU; f++)
+        if (port_type(f) == rank_type(r) && fu_ready[f] && n_issue < ISSUE_W)
+          for (int e = 0; e < RS_SZ; e++)
+          if (!issue_valid[f] && ready[e] && !granted[e] && rs_map[e].fu_type == port_type(f)) begin
+            issue_valid[f] = `TRUE;
+            grant_idx[f]   = PTR_W'(e);
+            granted[e]     = `TRUE;
+            n_issue++;
+          end
+    for (int f = 0; f < `NUM_FU; f++) issue_pkt[f] = rs_map[grant_idx[f]];
+  end
+
 
   always_ff @(posedge clock) begin
     if (reset) rs_valid <= '0;
@@ -77,6 +138,7 @@ module rs #(
         rs_map[alloc_idx[i]]   <= cdb_pkt[i];
         rs_valid[alloc_idx[i]] <= `TRUE;
       end
+      for (int f = 0; f < `NUM_FU; f++) if (issue_valid[f]) rs_valid[grant_idx[f]] <= `FALSE;
     end
   end
 

@@ -13,7 +13,7 @@
 
 module testbench;
 
-    localparam RD_SZ   = 2 * `SUPERSCALAR_WIDTH;
+    localparam RD_SZ   = 2 * `ISSUE_WIDTH;
     localparam WR_SZ   = `NUM_CDB;
     localparam TAG_W   = $clog2(`PHYS_REG_SZ);
     localparam NUM_REG = `PHYS_REG_SZ;
