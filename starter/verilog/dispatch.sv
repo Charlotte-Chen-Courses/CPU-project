@@ -24,7 +24,7 @@
 //                    freelist rewinds, the RAT loads recover_map, the //
 //                    busy table clears.                               //
 //                 Anything else (illegal, or no unit yet: load/store, //
-//                 mult, FP, CSR, A) gets a ROB entry that is done at  //
+//                 FP, CSR, A) gets a ROB entry that is done at        //
 //                 dispatch with an exception and no destination, and  //
 //                 never enters the RS; the ROB raises it at commit.   //
 //                                                                     //
@@ -140,7 +140,8 @@ module dispatch #(
   always_comb
     for (int i = 0; i < W; i++) begin
       unsupported[i] = !((fu_type[i] == FU_ALU && !cond_branch[i] && !uncond_branch[i]) ||
-                         (fu_type[i] == FU_BRANCH && (cond_branch[i] || uncond_branch[i]))) ||
+                         (fu_type[i] == FU_BRANCH && (cond_branch[i] || uncond_branch[i])) ||
+                         fu_type[i] == FU_MULT || fu_type[i] == FU_DIV) ||
                        rd_mem[i] || wr_mem[i] || csr_op[i] || atomic[i] ||
                        rs1_fp[i] || rs2_fp[i] || rd_fp[i] || rs3_used[i];
       exc[i]          = illegal[i] ? EXC_ILLEGAL : unsupported[i] ? EXC_UNSUPPORTED : EXC_NONE;

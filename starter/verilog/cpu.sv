@@ -37,7 +37,9 @@
 //                 target) are raised only at commit: the core stops   //
 //                 with halted + exception + exception_pc. On a wrong  //
 //                 path they are squashed like everything else.        //
-//                 Not yet: MULT, LSQ, FP, checkpoints.                //
+//                 M extension: pipelined multiplier (mult_fu) and     //
+//                 iterative divider (div_fu), each its own port.      //
+//                 Not yet: LSQ, FP, checkpoints.                      //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -371,6 +373,34 @@ module cpu #(
       );
     end else if (g < `NUM_FU_ALU + `NUM_FU_BRANCH) begin : gen_branch
       branch_fu branch_fu_0 (
+          .clock    (clock),
+          .reset    (reset),
+          .in_valid (issue_valid[g]),
+          .in_pkt   (issue_pkt[g]),
+          .ready    (fu_ready[g]),
+          .out_valid(fu_out_valid[g]),
+          .out_pkt  (fu_out_pkt[g]),
+          .out_grant(fu_grant[g]),
+          .flush    (flush),
+          .rs1_value(rs1_value[g]),
+          .rs2_value(rs2_value[g])
+      );
+    end else if (g < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT) begin : gen_mult
+      mult_fu mult_fu_0 (
+          .clock    (clock),
+          .reset    (reset),
+          .in_valid (issue_valid[g]),
+          .in_pkt   (issue_pkt[g]),
+          .ready    (fu_ready[g]),
+          .out_valid(fu_out_valid[g]),
+          .out_pkt  (fu_out_pkt[g]),
+          .out_grant(fu_grant[g]),
+          .flush    (flush),
+          .rs1_value(rs1_value[g]),
+          .rs2_value(rs2_value[g])
+      );
+    end else if (g < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV) begin : gen_div
+      div_fu div_fu_0 (
           .clock    (clock),
           .reset    (reset),
           .in_valid (issue_valid[g]),

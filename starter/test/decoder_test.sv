@@ -125,10 +125,10 @@ module testbench;
             // ---- M ----
             check("mul",    R(7'b0000001, 3'b000, 7'b0110011), E(FU_MULT, 1));
             check("mulhu",  R(7'b0000001, 3'b011, 7'b0110011), E(FU_MULT, 1));
-            check("div",    R(7'b0000001, 3'b100, 7'b0110011), E(FU_MULT, 1));
-            check("divu",   R(7'b0000001, 3'b101, 7'b0110011), E(FU_MULT, 1));
-            check("rem",    R(7'b0000001, 3'b110, 7'b0110011), E(FU_MULT, 1));
-            check("remu",   R(7'b0000001, 3'b111, 7'b0110011), E(FU_MULT, 1));
+            check("div",    R(7'b0000001, 3'b100, 7'b0110011), E(FU_DIV, 1));
+            check("divu",   R(7'b0000001, 3'b101, 7'b0110011), E(FU_DIV, 1));
+            check("rem",    R(7'b0000001, 3'b110, 7'b0110011), E(FU_DIV, 1));
+            check("remu",   R(7'b0000001, 3'b111, 7'b0110011), E(FU_DIV, 1));
 
             // ---- FENCE / CSR ----
             check("fence",   I(3'b000, 7'b0001111), E(FU_ALU, 0));

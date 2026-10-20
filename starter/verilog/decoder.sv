@@ -220,26 +220,26 @@ module decoder (
                     alu_func   = ALU_MULHU;
                     fu_type    = FU_MULT;
                 end
-                // M: divide/remainder (needs a divider in the MULT/M unit)
+                // M: divide/remainder -> iterative divider (div_fu)
                 `RV32_DIV: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_DIV;
-                    fu_type    = FU_MULT;
+                    fu_type    = FU_DIV;
                 end
                 `RV32_DIVU: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_DIVU;
-                    fu_type    = FU_MULT;
+                    fu_type    = FU_DIV;
                 end
                 `RV32_REM: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_REM;
-                    fu_type    = FU_MULT;
+                    fu_type    = FU_DIV;
                 end
                 `RV32_REMU: begin
                     has_dest   = `TRUE;
                     alu_func   = ALU_REMU;
-                    fu_type    = FU_MULT;
+                    fu_type    = FU_DIV;
                 end
                 // single core, no self-modifying code: FENCE / FENCE.I act as no-ops
                 `RV32_FENCE_, `RV32_FENCE_I: begin

@@ -11,8 +11,8 @@
 //                 packet is in flight, ready, the right FU type for   //
 //                 its port, issued once, and unchanged apart from     //
 //                 ready bits; and no lost issue: at most ISSUE_WIDTH  //
-//                 issue per cycle, FU types served FP > MULT > LOAD > //
-//                 STORE > BRANCH > ALU, each type taking min(#ready,  //
+//                 issue per cycle, FU types served DIV > FP > MULT >  //
+//                 LOAD > STORE > BRANCH > ALU, each taking min(#ready,//
 //                 #free ports, slots left). Directed                  //
 //                 tests cover wakeup timing, same-cycle dispatch+CDB  //
 //                 bypass, fu_ready backpressure, and fill/reuse; then //
@@ -67,7 +67,8 @@ module testbench;
         if (f < `NUM_FU_ALU) return FU_ALU;
         if (f < `NUM_FU_ALU + `NUM_FU_BRANCH) return FU_BRANCH;
         if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT) return FU_MULT;
-        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV) return FU_DIV;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV + `NUM_FU_LOAD) return FU_LOAD;
         if (f < `NUM_FU - `NUM_FU_FP) return FU_STORE;
         return FU_FP;
     endfunction
@@ -203,7 +204,7 @@ module testbench;
         // FP > MULT > LOAD > STORE > ALU; each takes min(ready, free ports, slots left)
         begin
             automatic int left = ISSUE_W;
-            automatic FU_TYPE order [] = '{FU_FP, FU_MULT, FU_LOAD, FU_STORE, FU_BRANCH, FU_ALU};
+            automatic FU_TYPE order [] = '{FU_DIV, FU_FP, FU_MULT, FU_LOAD, FU_STORE, FU_BRANCH, FU_ALU};
             foreach (order[o]) begin
                 automatic FU_TYPE t = order[o];
                 automatic int expect_n;

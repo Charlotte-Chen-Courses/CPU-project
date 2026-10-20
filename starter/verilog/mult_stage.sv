@@ -8,6 +8,7 @@
 
 module mult_stage (
     input clock, reset, start,
+    input en,   // 0 = hold every register (the result ahead could not leave the pipeline)
     input [63:0] prev_sum, mplier, mcand,
 
     output logic [63:0] product_sum, next_mplier, next_mcand,
@@ -24,15 +25,17 @@ module mult_stage (
     assign shifted_mcand = {mcand[63-SHIFT:0], SHIFT'('b0)};
 
     always_ff @(posedge clock) begin
-        product_sum <= prev_sum + partial_product;
-        next_mplier <= shifted_mplier;
-        next_mcand  <= shifted_mcand;
+        if (en) begin
+            product_sum <= prev_sum + partial_product;
+            next_mplier <= shifted_mplier;
+            next_mcand  <= shifted_mcand;
+        end
     end
 
     always_ff @(posedge clock) begin
         if (reset) begin
             done <= 1'b0;
-        end else begin
+        end else if (en) begin
             done <= start;
         end
     end

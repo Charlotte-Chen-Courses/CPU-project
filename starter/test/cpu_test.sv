@@ -114,9 +114,12 @@ module testbench;
         int rd  = $urandom_range(dlo, dhi);
         int rs1 = $urandom_range(0, nsrc - 1);
         int rs2 = $urandom_range(0, nsrc - 1);
-        int op  = $urandom_range(0, 17);
+        int op  = $urandom_range(0, 21);
         int sk  = $urandom_range(0, 2);
+        int mf  = $urandom_range(0, 7);
         case (op)
+            18, 19, 20: return enc_r(7'b0000001, 3'(mf % 4), rd, rs1, rs2);        // mul, mulh, mulhsu, mulhu
+            21:         return enc_r(7'b0000001, 3'(4 + mf % 4), rd, rs1, rs2);    // div, divu, rem, remu
             0:  return enc_r(7'b0000000, 3'b000, rd, rs1, rs2);   // add
             1:  return enc_r(7'b0100000, 3'b000, rd, rs1, rs2);   // sub
             2:  return enc_r(7'b0000000, 3'b001, rd, rs1, rs2);   // sll
@@ -173,8 +176,7 @@ module testbench;
             return ISS_WFI;
         end
         // legal instructions this core has no unit for yet, and a known-illegal word
-        if (i[6:0] == 7'b0000011 || i[6:0] == 7'b0100011 ||
-            (i[6:0] == 7'b0110011 && i[31:25] == 7'b0000001)) begin
+        if (i[6:0] == 7'b0000011 || i[6:0] == 7'b0100011 || i[6:0] == 7'b1010011) begin
             writes = 0; exc = EXC_UNSUPPORTED; return ISS_EXC;
         end
         if (i[6:0] == 7'b1111111) begin
@@ -193,7 +195,23 @@ module testbench;
                 3'b001: value = a << sh;
                 3'b101: value = i[30] ? 32'($signed(a) >>> sh) : (a >> sh);
             endcase
-            7'b0110011: case (i[14:12])
+            7'b0110011: if (i[31:25] == 7'b0000001) begin                  // M extension
+                automatic logic signed [63:0] ss = $signed({{32{a[31]}}, a}) * $signed({{32{b[31]}}, b});
+                automatic logic signed [63:0] su = $signed({{32{a[31]}}, a}) * $signed({32'b0, b});
+                automatic logic        [63:0] uu = {32'b0, a} * {32'b0, b};
+                automatic bit ovf = (a == 32'h8000_0000 && b == 32'hffff_ffff);
+                iss_m++;
+                case (i[14:12])
+                    3'b000: value = uu[31:0];                                         // mul
+                    3'b001: value = ss[63:32];                                        // mulh
+                    3'b010: value = su[63:32];                                        // mulhsu
+                    3'b011: value = uu[63:32];                                        // mulhu
+                    3'b100: value = (b == 0) ? '1 : ovf ? a : 32'($signed(a) / $signed(b)); // div
+                    3'b101: value = (b == 0) ? '1 : a / b;                            // divu
+                    3'b110: value = (b == 0) ? a  : ovf ? 0 : 32'($signed(a) % $signed(b)); // rem
+                    3'b111: value = (b == 0) ? a  : a % b;                            // remu
+                endcase
+            end else case (i[14:12])
                 3'b000: value = i[30] ? (a - b) : (a + b);
                 3'b001: value = a << b[4:0];
                 3'b010: value = ($signed(a) < $signed(b)) ? 1 : 0;
@@ -262,13 +280,13 @@ module testbench;
     endfunction
 
     // an instruction the core must never execute: only placed where control flow skips it, so
-    // it appears only on wrong paths (load, store, mul, illegal word, misaligned jalr/jal)
+    // it appears only on wrong paths (load, store, FP op, illegal word, misaligned jalr/jal)
     function automatic logic [31:0] junk();
         int kind = $urandom_range(0, 5);
         case (kind)
             0: return {12'($urandom), 5'($urandom_range(0, 7)), 3'b010, 5'($urandom_range(1, 7)), 7'b0000011}; // lw
             1: return {7'($urandom), 5'($urandom_range(0, 7)), 5'($urandom_range(0, 7)), 3'b010, 5'($urandom), 7'b0100011}; // sw
-            2: return enc_r(7'b0000001, 3'b000, $urandom_range(1, 7), $urandom_range(0, 7), $urandom_range(0, 7)); // mul
+            2: return {7'b0000000, 5'($urandom), 5'($urandom), 3'b111, 5'($urandom), 7'b1010011};         // fadd.s
             3: return {25'($urandom), 7'b1111111};                                              // illegal
             4: return enc_jalr(0, 0, 2);                                                         // jalr -> 2
             default: return enc_jal(0, 2);                                                       // jal -> +2
@@ -378,6 +396,7 @@ module testbench;
     longint total_cycles = 0, total_committed = 0, total_branches = 0, total_flushes = 0;
     longint stall_rob = 0, stall_rs = 0, stall_freelist = 0;
     int     n_exc_programs = 0;
+    longint iss_m = 0, total_m = 0;   // M-extension instructions executed
     longint last_flushes, last_branches, last_cycles, last_committed, last_ret_misp;
 
     task automatic fail(input string msg);
@@ -412,6 +431,7 @@ module testbench;
         emit_functions();                 // after the WFI: reached only through calls
         iss_branches = 0;
         expect_n = iss_count();
+        iss_m = 0;
         limit = 60 * expect_n + 2000;
         iss_reset();
         iss_branches = 0;
@@ -494,6 +514,7 @@ module testbench;
         total_committed += committed;
         total_branches  += iss_branches;
         total_flushes   += flushes;
+        total_m         += iss_m;
         last_flushes     = flushes;
         last_branches    = iss_branches;
         last_cycles      = cycles;
@@ -571,7 +592,7 @@ module testbench;
         emit(32'h00002083);                           // slot 1: lw (wrong path)
         emit(enc_jal(0, 28));                         // jump over six junk words
         emit({7'd0, 5'd2, 5'd0, 3'b010, 5'd4, 7'b0100011});     // sw
-        emit(enc_r(7'b0000001, 3'b000, 3, 1, 2));    // mul
+        emit({7'b0000000, 5'd2, 5'd1, 3'b111, 5'd3, 7'b1010011});  // fadd.s
         emit(32'hffff_ffff);                          // illegal
         emit(enc_jalr(0, 0, 2));                      // jalr -> 2 (misaligned)
         emit(enc_jal(0, 2));                          // jal -> +2 (misaligned)
@@ -586,8 +607,8 @@ module testbench;
         run_program("correct-path lw");
         start_program(); emit(32'hffff_ffff); emit(enc_i(3'b000, 3, 0, 12'd1));
         run_program("correct-path illegal");
-        start_program(); emit(enc_r(7'b0000001, 3'b000, 3, 1, 2));
-        run_program("correct-path mul");
+        start_program(); emit({7'b0000000, 5'd2, 5'd1, 3'b111, 5'd3, 7'b1010011});
+        run_program("correct-path fadd.s");
         start_program(); emit(enc_jal(1, 2)); emit(enc_i(3'b000, 3, 0, 12'd1));
         run_program("correct-path misaligned jal (x1 must not be written)");
         start_program(); emit(enc_b(3'b000, 0, 0, 6)); emit(enc_i(3'b000, 3, 0, 12'd1));
@@ -603,8 +624,54 @@ module testbench;
         emit(enc_i(3'b000, 4, 0, 12'd1));
         run_program("exception + mispredict");
 
+        // ---- M extension ----
+        $display("Test 11: multiply / divide on edge operands, including x/0 and INT_MIN/-1");
+        start_program();
+        begin
+            automatic logic [31:0] ev [6] = '{32'h0, 32'h1, 32'hffff_ffff, 32'h8000_0000, 32'h7fff_ffff, 32'hdead_beef};
+            for (int i = 0; i < 6; i++) begin
+                emit(enc_u(7'b0110111, 1, ev[i][31:12] + ev[i][11]));   // x1 = ev[i] (lui + addi)
+                emit(enc_i(3'b000, 1, 1, ev[i][11:0]));
+                for (int j = 0; j < 6; j++) begin
+                    emit(enc_u(7'b0110111, 2, ev[j][31:12] + ev[j][11]));
+                    emit(enc_i(3'b000, 2, 2, ev[j][11:0]));
+                    for (int f = 0; f < 8; f++) emit(enc_r(7'b0000001, 3'(f), 3 + f, 1, 2));
+                end
+            end
+        end
+        run_program("M edge operands");
+
+        $display("Test 12: dependent chain through the multiplier and the divider");
+        start_program();
+        emit(enc_i(3'b000, 1, 0, 12'd3));
+        for (int n = 0; n < 40; n++) begin
+            emit(enc_r(7'b0000001, 3'b000, 1, 1, 1));       // x1 = x1 * x1
+            emit(enc_i(3'b000, 1, 1, 12'd7));               // x1 += 7
+            if (n % 8 == 0) emit(enc_r(7'b0000001, 3'b101, 2, 1, 3));   // x2 = x1 / x3 (divu)
+        end
+        run_program("M chain");
+        $display("  (M chain: IPC %.2f)", real'(last_committed) / real'(last_cycles));
+
+        $display("Test 13: independent multiplies back to back, with ALU work competing for the CDBs");
+        start_program();
+        for (int n = 0; n < 300; n++)
+            emit((n % 3 == 2) ? enc_i(3'b000, 8 + n % 5, 8 + n % 5, 12'd1)
+                              : enc_r(7'b0000001, 3'(n % 4), 3 + n % 5, 1 + n % 7, 2 + n % 5));
+        run_program("M throughput");
+        $display("  (M throughput: IPC %.2f)", real'(last_committed) / real'(last_cycles));
+
+        $display("Test 14: a divide squashed by a mispredict, and a divide on the wrong path");
+        start_program();
+        emit(enc_r(7'b0000001, 3'b100, 3, 1, 2));           // long divide in flight...
+        emit(enc_b(3'b000, 0, 0, 12));                      // ...while a taken branch mispredicts
+        emit(enc_r(7'b0000001, 3'b110, 4, 1, 2));           // wrong path: rem
+        emit(enc_r(7'b0000001, 3'b000, 5, 1, 2));           // wrong path: mul
+        emit(enc_r(7'b0000001, 3'b101, 6, 3, 1));           // correct path: divu, reads the first divide
+        emit(enc_r(7'b0000001, 3'b001, 7, 6, 3));
+        run_program("M + flush");
+
         // ---- RAS ----
-        $display("Test 12: one function called from two sites in a hot loop (returns alternate)");
+        $display("Test 15: one function called from two sites in a hot loop (returns alternate)");
         start_program();
         emit(enc_i(3'b000, 7, 0, 12'd100));
         begin
@@ -628,7 +695,7 @@ module testbench;
         if (`BTB_SZ >= 16 && `RAS_SZ >= 2 && last_flushes > 10)
             fail($sformatf("two call sites: %0d mispredicts; the RAS should predict every return", last_flushes));
 
-        $display("Test 13: calls nested 12 deep (deeper than the %0d-entry RAS), 20 times", `RAS_SZ);
+        $display("Test 16: calls nested 12 deep (deeper than the %0d-entry RAS), 20 times", `RAS_SZ);
         start_program();
         emit(enc_i(3'b000, 7, 0, 12'd20));
         begin
@@ -653,7 +720,7 @@ module testbench;
         $display("  (deep calls: %0d branches/jumps, %0d mispredicts, IPC %.2f)",
                  last_branches, last_flushes, real'(last_committed) / real'(last_cycles));
 
-        $display("Test 14: RAS repair: mispredicts and fetch stalls inside a function, 100 calls");
+        $display("Test 17: RAS repair: mispredicts and fetch stalls inside a function, 100 calls");
         start_program();
         emit(enc_i(3'b000, 7, 0, 12'd100));
         emit(enc_i(3'b000, 8, 0, 12'd0));
@@ -690,7 +757,7 @@ module testbench;
             fail($sformatf("RAS repair: %0d return mispredicts; the RAS should be restored on every flush and only pushed by dispatched bundles", last_ret_misp));
 
         // ---- predictor: a hot loop (each static branch runs many times) ----
-        $display("Test 11: hot loop, 200 iterations: back-edge, a never-taken if, a jal, and a jalr");
+        $display("Test 18: hot loop, 200 iterations: back-edge, a never-taken if, a jal, and a jalr");
         start_program();
         emit(enc_i(3'b000, 7, 0, 12'd200));           // x7 = 200
         begin
@@ -714,7 +781,7 @@ module testbench;
             fail($sformatf("hot loop: %0d mispredicts; a trained BTB + bimodal should miss only while warming up", last_flushes));
 
         // ---- random ----
-        $display("Test 16: 300 random programs (branches, jumps, loops, calls, wrong-path junk; x0..x7)");
+        $display("Test 19: 300 random programs (branches, jumps, loops, calls, wrong-path junk; x0..x7)");
         for (int p = 0; p < 300; p++) begin
             start_program();
             while (prog_len < 62 + 250) emit_block(0, 7, 1);
@@ -722,7 +789,7 @@ module testbench;
             if (errors > 0) break;
         end
 
-        $display("Test 17: 20 long random programs (x0..x31 straight-line + branch blocks)");
+        $display("Test 20: 20 long random programs (x0..x31 straight-line + branch blocks)");
         for (int p = 0; p < 20; p++) begin
             start_program();
             while (prog_len < 62 + 2000) begin
@@ -740,6 +807,7 @@ module testbench;
         $display("  (dispatch blocked: ROB full %0d, RS full %0d, no free tag %0d cycles)",
                  stall_rob, stall_rs, stall_freelist);
         $display("  (%0d programs ended in an exception, as expected)", n_exc_programs);
+        $display("  (multiply/divide instructions executed: %0d)", total_m);
         if (errors == 0) $display("@@@ Passed");
         else             $display("@@@ Failed (%0d errors)", errors);
         $finish;

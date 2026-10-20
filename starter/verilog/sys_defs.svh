@@ -62,38 +62,42 @@ typedef enum logic [2:0] {
   FU_LOAD,
   FU_STORE,
   FU_FP,
-  FU_BRANCH   // cond branches, jal, jalr (appended: existing encodings unchanged)
+  FU_BRANCH,  // cond branches, jal, jalr (appended: existing encodings unchanged)
+  FU_DIV      // div, divu, rem, remu: iterative divider
 } FU_TYPE;
 
 `define NUM_FU_ALU 1
 `define NUM_FU_BRANCH 1
-`define NUM_FU_MULT 0
+`define NUM_FU_MULT 1
+`define NUM_FU_DIV 1
 `define NUM_FU_LOAD 0
 `define NUM_FU_STORE 0
 `define NUM_FU_FP 0
-`define NUM_FU (`NUM_FU_ALU+`NUM_FU_BRANCH+`NUM_FU_MULT+`NUM_FU_LOAD+`NUM_FU_STORE+`NUM_FU_FP)
+`define NUM_FU (`NUM_FU_ALU+`NUM_FU_BRANCH+`NUM_FU_MULT+`NUM_FU_DIV+`NUM_FU_LOAD+`NUM_FU_STORE+`NUM_FU_FP)
 
 // Ports (RS issue ports = FU instances = CDB-arbiter inputs) are grouped by FU type in
-// this order: ALU, BRANCH, MULT, LOAD, STORE, FP. Shared by rs.sv, cdb_arbiter.sv, cpu.sv.
+// this order: ALU, BRANCH, MULT, DIV, LOAD, STORE, FP. Shared by rs.sv, cdb_arbiter.sv, cpu.sv.
 function automatic FU_TYPE port_type(input int f);
   if (f < `NUM_FU_ALU) return FU_ALU;
   if (f < `NUM_FU_ALU + `NUM_FU_BRANCH) return FU_BRANCH;
   if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT) return FU_MULT;
-  if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
+  if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV) return FU_DIV;
+  if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV + `NUM_FU_LOAD) return FU_LOAD;
   if (f < `NUM_FU - `NUM_FU_FP) return FU_STORE;
   return FU_FP;
 endfunction
 
 // Priority between FU types (RS issue when slots run out, CDB arbitration):
 // longest latency first, then branches (resolve early), then ALU. Rank 0 is served first.
-`define NUM_FU_RANKS 6
+`define NUM_FU_RANKS 7
 function automatic FU_TYPE rank_type(input int r);
   case (r)
-    0:       return FU_FP;
-    1:       return FU_MULT;
-    2:       return FU_LOAD;
-    3:       return FU_STORE;
-    4:       return FU_BRANCH;
+    0:       return FU_DIV;
+    1:       return FU_FP;
+    2:       return FU_MULT;
+    3:       return FU_LOAD;
+    4:       return FU_STORE;
+    5:       return FU_BRANCH;
     default: return FU_ALU;
   endcase
 endfunction
@@ -317,10 +321,10 @@ typedef enum logic [4:0] {
   ALU_MULH   = 5'h0b,  // Mult FU
   ALU_MULHSU = 5'h0c,  // Mult FU
   ALU_MULHU  = 5'h0d,  // Mult FU
-  ALU_DIV    = 5'h0e,  // unused
-  ALU_DIVU   = 5'h0f,  // unused
-  ALU_REM    = 5'h10,  // unused
-  ALU_REMU   = 5'h11   // unused
+  ALU_DIV    = 5'h0e,  // Div FU
+  ALU_DIVU   = 5'h0f,  // Div FU
+  ALU_REM    = 5'h10,  // Div FU
+  ALU_REMU   = 5'h11   // Div FU
 } ALU_FUNC;
 
 ////////////////////////////////

@@ -14,6 +14,7 @@ module mult (
     input clock, reset,
     input [63:0] mcand, mplier,
     input start,
+    input en,   // 0 = stall the whole pipeline (added for the OoO core's CDB backpressure)
 
     output [63:0] product,
     output done
@@ -28,6 +29,7 @@ module mult (
     mult_stage mstage [`MULT_STAGES-1:0] (
         .clock (clock),
         .reset (reset),
+        .en          (en),                             // same enable for every stage
         .start       ({internal_dones,        start}), // forward prev done as next start
         .prev_sum    ({internal_product_sums, 64'h0}), // start the sum at 0
         .mplier      ({internal_mpliers,      mplier}),

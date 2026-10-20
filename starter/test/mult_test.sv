@@ -13,6 +13,7 @@ module testbench;
         .mcand(a),
         .mplier(b),
         .start(start),
+        .en(1'b1),
         .product(result),
         .done(done)
     );
