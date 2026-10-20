@@ -15,7 +15,7 @@
 //                 (rank_type in sys_defs). fu_ready backpressures a   //
 //                 port. Issued entries free at the clock edge.        //
 //                 Known: lowest-index select can starve high slots.   //
-//                 No flush yet.                                       //
+//                 flush clears all.                                   //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -40,6 +40,8 @@ module rs #(
     // CDB stage
     input [CDB_SZ-1:0]            cdb_valid,
     input [CDB_SZ-1:0][TAG_W-1:0] cdb_tag,
+
+    input flush,  // branch mispredict: squash every entry
 
     // issue
     input [NUM_FU-1:0] fu_ready,
@@ -123,7 +125,7 @@ module rs #(
 
 
   always_ff @(posedge clock) begin
-    if (reset) rs_valid <= '0;
+    if (reset || flush) rs_valid <= '0;
     else begin
       for (int e = 0; e < RS_SZ; e++) begin
         if (rs_valid[e])

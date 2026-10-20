@@ -12,7 +12,9 @@
 //                 the pointer only moves if every request fits.       //
 //                 Requests need not be packed (e.g. alloc_req=2'b10). //
 //                 Overflow cannot happen in a correct core, so it is  //
-//                 asserted rather than handled.                       //
+//                 asserted rather than handled. flush (mispredict)    //
+//                 rewinds alloc_ptr to free_ptr after this cycle's    //
+//                 frees: every uncommitted tag is free again.         //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -30,7 +32,9 @@ module freelist #(
     output logic alloc_ok,  // enough free for all requests (depends on alloc_req)
     output logic can_alloc_w,  // >= W tags free; state only -> use this for rename_fire
     input [W-1:0] free_en,  // slot i commits with an old preg
-    input [W-1:0][TAG_W-1:0] free_tag  // old preg from committing ROB entry
+    input [W-1:0][TAG_W-1:0] free_tag,  // old preg from committing ROB entry
+    // mispredict: every tag handed out but not yet committed becomes free again
+    input flush
 );
   logic [TAG_W-1:0] freelist_mem[`FREE_LIST_SZ];
   logic [PTR_W-1:0] alloc_ptr, free_ptr;
@@ -69,8 +73,16 @@ module freelist #(
       for (int j = 0; j < W; j++) if (free_en[j]) freelist_mem[free_idx[j]] <= free_tag[j];
 
       free_ptr <= PTR_W'((int'(free_ptr) + n_free) % `FREE_LIST_SZ);
-      if (alloc_ok) alloc_ptr <= PTR_W'((int'(alloc_ptr) + n_alloc) % `FREE_LIST_SZ);
-      free_count <= $bits(free_count)'(int'(free_count) + n_free - (alloc_ok ? n_alloc : 0));
+      if (flush) begin
+        // tags in [free_ptr, alloc_ptr) belong to uncommitted instructions (each commit
+        // frees one tag and retires one allocation, so free_ptr tracks the oldest one):
+        // rewind alloc_ptr to free_ptr AFTER this cycle's frees -> whole list free
+        alloc_ptr  <= PTR_W'((int'(free_ptr) + n_free) % `FREE_LIST_SZ);
+        free_count <= `FREE_LIST_SZ;
+      end else begin
+        if (alloc_ok) alloc_ptr <= PTR_W'((int'(alloc_ptr) + n_alloc) % `FREE_LIST_SZ);
+        free_count <= $bits(free_count)'(int'(free_count) + n_free - (alloc_ok ? n_alloc : 0));
+      end
     end
   end
 

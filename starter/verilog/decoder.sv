@@ -5,7 +5,8 @@
 //  Description :  Instruction decoder, from the P3 stage_id.sv,       //
 //                 extended for RV32IMAF. The original P3 outputs and  //
 //                 their behaviour for P3 instructions are unchanged.  //
-//                 Added: fu_type (which functional unit), register    //
+//                 Added: fu_type (which functional unit; branches and //
+//                 jal/jalr -> FU_BRANCH), register                    //
 //                 class per operand (rs1_fp/rs2_fp/rd_fp), rs3_used   //
 //                 (fused multiply-add), atomic (LR/SC/AMO); and       //
 //                 decode for div/rem, FENCE/FENCE.I (no-ops), the     //
@@ -88,18 +89,21 @@ module decoder (
                     opa_select    = OPA_IS_PC;
                     opb_select    = OPB_IS_J_IMM;
                     uncond_branch = `TRUE;
+                    fu_type       = FU_BRANCH;
                 end
                 `RV32_JALR: begin
                     has_dest      = `TRUE;
                     opa_select    = OPA_IS_RS1;
                     opb_select    = OPB_IS_I_IMM;
                     uncond_branch = `TRUE;
+                    fu_type       = FU_BRANCH;
                 end
                 `RV32_BEQ, `RV32_BNE, `RV32_BLT, `RV32_BGE,
                 `RV32_BLTU, `RV32_BGEU: begin
                     opa_select  = OPA_IS_PC;
                     opb_select  = OPB_IS_B_IMM;
                     cond_branch = `TRUE;
+                    fu_type     = FU_BRANCH;
                 end
                 `RV32_LB, `RV32_LH, `RV32_LW,
                 `RV32_LBU, `RV32_LHU: begin

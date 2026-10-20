@@ -28,6 +28,9 @@ module testbench;
     logic [W-1:0][4:0]       rs1, rs2, rd;
     logic [W-1:0][TAG_W-1:0] new_tag;
     logic [W-1:0][TAG_W-1:0] src1_tag, src2_tag, told;
+    logic [W-1:0]            src1_bypassed, src2_bypassed;
+    logic                    recover;
+    logic [NARCH-1:0][TAG_W-1:0] recover_map;
 
     rat dut (
         .clock    (clock),
@@ -41,7 +44,11 @@ module testbench;
         .new_tag  (new_tag),
         .src1_tag (src1_tag),
         .src2_tag (src2_tag),
-        .told     (told)
+        .told     (told),
+        .src1_bypassed(src1_bypassed),
+        .src2_bypassed(src2_bypassed),
+        .recover  (recover),
+        .recover_map(recover_map)
     );
 
     always #5 clock = ~clock;
@@ -68,7 +75,7 @@ module testbench;
     endtask
 
     task automatic idle();
-        rename_en = 0; valid = '0; has_dest = '0;
+        rename_en = 0; valid = '0; has_dest = '0; recover = 0; recover_map = '0;
         rs1 = '0; rs2 = '0; rd = '0; new_tag = '0;
     endtask
 
@@ -83,11 +90,17 @@ module testbench;
     // check outputs against an in-order model, then clock; model commits only if rename_en
     task automatic step(input string what);
         int m [NARCH];
+        bit from_bundle [NARCH];    // reg was renamed by an older slot of this bundle
         int e1, e2, et;
         #1;
         m = model;
+        foreach (from_bundle[r]) from_bundle[r] = 0;
         for (int i = 0; i < W; i++) begin
             e1 = m[rs1[i]]; e2 = m[rs2[i]]; et = m[rd[i]];
+            if (src1_bypassed[i] !== from_bundle[rs1[i]])
+                fail($sformatf("[%s] slot %0d src1_bypassed=%b expected %b", what, i, src1_bypassed[i], from_bundle[rs1[i]]));
+            if (src2_bypassed[i] !== from_bundle[rs2[i]])
+                fail($sformatf("[%s] slot %0d src2_bypassed=%b expected %b", what, i, src2_bypassed[i], from_bundle[rs2[i]]));
             if (src1_tag[i] !== TAG_W'(e1))
                 fail($sformatf("[%s] slot %0d src1 x%0d: got p%0d expected p%0d", what, i, rs1[i], src1_tag[i], e1));
             if (src2_tag[i] !== TAG_W'(e2))
@@ -95,10 +108,14 @@ module testbench;
             if (told[i] !== TAG_W'(et))
                 fail($sformatf("[%s] slot %0d told x%0d: got p%0d expected p%0d", what, i, rd[i], told[i], et));
             // this slot's rename is visible to younger slots in the bundle
-            if (valid[i] && has_dest[i] && rd[i] != 0) m[rd[i]] = int'(new_tag[i]);
+            if (valid[i] && has_dest[i] && rd[i] != 0) begin
+                m[rd[i]] = int'(new_tag[i]);
+                from_bundle[rd[i]] = 1;
+            end
         end
         @(posedge clock);
-        if (rename_en) model = m;
+        if (recover) foreach (model[r]) model[r] = int'(recover_map[r]);   // recover wins
+        else if (rename_en) model = m;
         @(negedge clock);
     endtask
 
@@ -179,8 +196,16 @@ module testbench;
         step("stalled bundle");
         check_all("after stall");
 
+        // 8) recover: the whole map is replaced, even while a bundle renames
+        $display("Test 8: recover loads recover_map (wins over a rename)");
+        idle(); rename_en = 1; slot(0, 1, 2, 9);
+        recover = 1;
+        for (int x = 1; x < NARCH; x++) recover_map[x] = TAG_W'(NARCH + x % (`PHYS_REG_SZ - NARCH));
+        step("recover + rename");
+        check_all("after recover");
+
         // 8) random bundles on x0..x7 so RAW/WAW collisions happen constantly
-        $display("Test 8: 20000 random cycles");
+        $display("Test 9: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
             idle();
             rename_en = ($urandom % 4) != 0;
@@ -190,6 +215,10 @@ module testbench;
                 else begin
                     rs1[i] = 5'($urandom % 8); rs2[i] = 5'($urandom % 8); rd[i] = 5'($urandom % 8);
                 end
+            if ($urandom % 50 == 0) begin
+                recover = 1;
+                for (int x = 1; x < NARCH; x++) recover_map[x] = TAG_W'($urandom_range(1, `PHYS_REG_SZ - 1));
+            end
             step("random");
         end
         check_all("final");

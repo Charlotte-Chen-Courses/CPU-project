@@ -29,6 +29,7 @@ module testbench;
     logic [W-1:0][TAG_W-1:0] set_tag;
     logic [C-1:0]            cdb_valid;
     logic [C-1:0][TAG_W-1:0] cdb_tag;
+    logic                    flush;
     logic [W-1:0][TAG_W-1:0] src1_tag, src2_tag;
     logic [W-1:0]            src1_ready, src2_ready;
 
@@ -39,6 +40,7 @@ module testbench;
         .set_tag   (set_tag),
         .cdb_valid (cdb_valid),
         .cdb_tag   (cdb_tag),
+        .flush     (flush),
         .src1_tag  (src1_tag),
         .src2_tag  (src2_tag),
         .src1_ready(src1_ready),
@@ -58,7 +60,7 @@ module testbench;
 
     task automatic idle();
         set_en = '0; set_tag = '0;
-        cdb_valid = '0; cdb_tag = '0;
+        cdb_valid = '0; cdb_tag = '0; flush = 0;
         src1_tag = '0; src2_tag = '0;
     endtask
 
@@ -80,8 +82,10 @@ module testbench;
                                what, i, src2_tag[i], src2_ready[i], exp_ready(src2_tag[i])));
         end
         @(posedge clock);
+        if (flush) for (int t = 0; t < NTAG; t++) busy[t] = 0;   // flush clears everything
+        else
         for (int k = 0; k < C; k++) if (cdb_valid[k]) busy[cdb_tag[k]] = 0;
-        for (int i = 0; i < W; i++) if (set_en[i] && set_tag[i] != 0) busy[set_tag[i]] = 1;
+        if (!flush) for (int i = 0; i < W; i++) if (set_en[i] && set_tag[i] != 0) busy[set_tag[i]] = 1;
         @(negedge clock);
     endtask
 
@@ -160,8 +164,16 @@ module testbench;
         step("multi broadcast + read");
         check_all("after multi");
 
-        // 7) random traffic: set only free tags, broadcast only busy tags (as the core does)
-        $display("Test 7: 20000 random cycles");
+        // 7) flush: every bit clears (even ones set in the same cycle)
+        $display("Test 7: flush clears every busy bit");
+        idle(); for (int i = 0; i < W; i++) begin set_en[i] = 1; set_tag[i] = TAG_W'(60 + i); end
+        step("set before flush");
+        idle(); set_en[0] = 1; set_tag[0] = 59; flush = 1;
+        step("flush");
+        check_all("after flush");
+
+        // 8) random traffic: set only free tags, broadcast only busy tags (as the core does)
+        $display("Test 8: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
             idle();
             used.delete();
@@ -181,6 +193,7 @@ module testbench;
                                                                  : TAG_W'($urandom);
                 src2_tag[i] = TAG_W'($urandom);
             end
+            flush = ($urandom % 200 == 0);
             step("random");
         end
         check_all("final");

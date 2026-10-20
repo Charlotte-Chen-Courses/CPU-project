@@ -4,7 +4,8 @@
 //                                                                     //
 //  Description :  Testbench for the retirement RAT. A model map is    //
 //                 updated slot by slot in commit order; every cycle   //
-//                 the whole DUT map is compared. Covers reset, one    //
+//                 the whole DUT map (and map_next before the edge) is //
+//                 compared. Covers reset, one                         //
 //                 commit, both slots committing the same rd (younger  //
 //                 wins), rd = x0 never remapped, and random commits   //
 //                 on x0..x7. Prints @@@ Passed/Failed.                //
@@ -23,7 +24,7 @@ module testbench;
     logic [W-1:0]                  commit_en;
     logic [W-1:0][4:0]             commit_rd;
     logic [W-1:0][TAG_W-1:0]       commit_tag;
-    logic [NARCH-1:0][TAG_W-1:0]   map;
+    logic [NARCH-1:0][TAG_W-1:0]   map, map_next;
 
     retire_rat dut (
         .clock     (clock),
@@ -31,7 +32,8 @@ module testbench;
         .commit_en (commit_en),
         .commit_rd (commit_rd),
         .commit_tag(commit_tag),
-        .map       (map)
+        .map       (map),
+        .map_next  (map_next)
     );
 
     always #5 clock = ~clock;
@@ -44,6 +46,18 @@ module testbench;
     endtask
 
     task automatic step(input string what);
+        #1;
+        // map_next: this cycle's commits already applied (used for mispredict recovery)
+        begin
+            automatic int nxt [NARCH] = model;
+            for (int i = 0; i < W; i++)
+                if (commit_en[i] && commit_rd[i] != 0) nxt[commit_rd[i]] = int'(commit_tag[i]);
+            for (int x = 0; x < NARCH; x++)
+                if (map_next[x] !== TAG_W'(nxt[x])) begin
+                    errors++;
+                    $display("  FAIL: [%s] map_next x%0d -> p%0d, expected p%0d", what, x, map_next[x], nxt[x]);
+                end
+        end
         @(posedge clock);
         for (int i = 0; i < W; i++)
             if (commit_en[i] && commit_rd[i] != 0) model[commit_rd[i]] = int'(commit_tag[i]);

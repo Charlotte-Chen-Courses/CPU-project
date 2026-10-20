@@ -13,7 +13,8 @@
 //                 rename_en, writes rd -> new_tag for each slot with  //
 //                 a real destination (valid, has_dest, rd != x0);     //
 //                 the youngest slot wins on a same-rd conflict.       //
-//                 No retirement RAT or recovery yet.                  //
+//                 recover (mispredict) loads recover_map: the         //
+//                 retirement map including this cycle's commits.      //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -41,7 +42,10 @@ module rat #(
     // source tag came from an older slot in this bundle (that value is not produced
     // yet, so the source must start NOT ready even though the busy bit is still clear)
     output logic [W-1:0] src1_bypassed,
-    src2_bypassed
+    src2_bypassed,
+    // mispredict: restore the committed mapping (including this cycle's commits)
+    input recover,
+    input [RAT_SZ-1:0][TAG_W-1:0] recover_map
 
 );
 
@@ -69,6 +73,8 @@ module rat #(
   always_ff @(posedge clock) begin
     if (reset) begin
       for (int i = 0; i < RAT_SZ; i++) map[i] <= TAG_W'(i);
+    end else if (recover) begin
+      map <= recover_map;
     end else if (rename_en) begin
       for (int i = 0; i < W; i++) if (dest_valid[i]) map[rd[i]] <= new_tag[i];
     end

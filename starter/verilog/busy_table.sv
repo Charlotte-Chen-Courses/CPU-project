@@ -10,7 +10,7 @@
 //                 never busy. Same-bundle dependencies are NOT        //
 //                 handled here (bit is set at the edge): rename       //
 //                 must mark a source bypassed by the RAT not ready.   //
-//                 No flush yet.                                       //
+//                 flush clears all.                                   //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -31,6 +31,8 @@ module busy_table #(
     // CDB: produced values become ready
     input        [CDB_SZ-1:0]            cdb_valid,
     input        [CDB_SZ-1:0][TAG_W-1:0] cdb_tag,
+    // mispredict: everything in flight is squashed, so every mapped register holds a value
+    input                                flush,
     // rename lookups: 2 sources per slot
     input        [     W-1:0][TAG_W-1:0] src1_tag,
     src2_tag,
@@ -52,7 +54,7 @@ module busy_table #(
 
 
   always_ff @(posedge clock) begin
-    if (reset) begin
+    if (reset || flush) begin
       for (int i = 0; i < BUSY_TABLE_SZ; i++) busy_table_map[i] <= `FALSE;
     end else begin
       for (int k = 0; k < CDB_SZ; k++) if (cdb_valid[k]) busy_table_map[cdb_tag[k]] <= `FALSE;

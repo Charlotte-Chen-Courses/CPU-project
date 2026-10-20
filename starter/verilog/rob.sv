@@ -18,6 +18,16 @@
 //                 Each entry also keeps its PC (commit trace) and a   //
 //                 halt bit: nothing younger than a committing halt    //
 //                 commits in the same cycle (commit_halt).            //
+//                 Branch recovery at commit: each entry has the next  //
+//                 PC fetch predicted and the actual next PC (PC+4, or //
+//                 a branch's result from the CDB). A committing entry //
+//                 where they differ raises flush + redirect_pc; it    //
+//                 commits, nothing younger does, and at the edge the  //
+//                 ROB empties (tail = new head, count = 0).           //
+//                 Exceptions (from dispatch, or a misaligned target   //
+//                 from the CDB) are raised when the entry commits:    //
+//                 commit_exception, no destination write, nothing     //
+//                 younger commits, no flush (the core stops).         //
 //                 No flush / mispredict recovery yet.                 //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
@@ -41,6 +51,12 @@ module rob #(
     input [W-1:0][TAG_W-1:0] disp_told,  // from RAT told
     input [W-1:0][`XLEN-1:0] disp_pc,
     input [W-1:0] disp_halt,  // WFI
+    input [W-1:0][`XLEN-1:0] disp_pred_npc,  // next PC fetch predicted
+    input EXCEPTION [W-1:0] disp_exception,  // != EXC_NONE: entry is done at dispatch
+    input [W-1:0] disp_is_br,  // branch / jump
+    input [W-1:0] disp_uncond,  // jal / jalr
+    input [W-1:0] disp_is_call,  // RAS push
+    input [W-1:0] disp_is_ret,  // RAS pop
     output logic [W-1:0][PTR_W-1:0] disp_idx,   // ROB index handed to each slot → RS → FU → CDB
     output logic space_ok,  // ≥ W free entries; must NOT depend on disp_valid
 
@@ -48,22 +64,36 @@ module rob #(
     // complete
     input [CDB_SZ-1:0] cdb_valid,
     input [CDB_SZ-1:0][PTR_W-1:0] cdb_rob_idx,
+    input [CDB_SZ-1:0] cdb_branch,  // branch result: cdb_next_pc is the actual next PC
+    input [CDB_SZ-1:0][`XLEN-1:0] cdb_next_pc,
+    input [CDB_SZ-1:0] cdb_misaligned,  // branch: taken target misaligned -> exception
 
     // commit
+    input commit_stop,  // the core has halted (WFI or exception committed): commit nothing more
     output logic [W-1:0]            commit_valid,
     output logic [W-1:0]            commit_dest_valid,
     output logic [W-1:0][      4:0] commit_rd,
     output logic [W-1:0][TAG_W-1:0] commit_tag,
     commit_told,
     output logic [W-1:0][`XLEN-1:0] commit_pc,
-    output logic [W-1:0] commit_halt  // this slot commits a halt; no younger slot commits
+    output logic [W-1:0] commit_is_br,  // committing a branch/jump (no exception): train the predictor
+    output logic [W-1:0] commit_uncond,
+    output logic [W-1:0] commit_is_call,  // committing a call / return (no exception): committed RAS
+    output logic [W-1:0] commit_is_ret,
+    output logic [W-1:0][`XLEN-1:0] commit_next_pc,  // its actual next PC
+    output logic [W-1:0] commit_halt,  // this slot commits a halt; no younger slot commits
+    output EXCEPTION [W-1:0] commit_exception,  // this slot raises an exception: it does not write
+                                                // its destination; nothing younger commits; no flush
+    // recovery: a committing instruction whose actual next PC != predicted next PC
+    output logic flush,  // squash everything younger (this cycle's edge)
+    output logic [`XLEN-1:0] redirect_pc  // where fetch restarts
 );
   ROB_PACKET rob_map[ROB_SZ];
   logic [PTR_W-1:0] head_ptr, tail_ptr, commit_idx;
 
   logic [$clog2(ROB_SZ+1)-1:0] rob_count;
   int n_disp, n_commit;
-  logic halt_seen;  // an older slot in this cycle's commit group is a halt
+  logic halt_seen;  // an older slot in this cycle's commit group is a halt or a mispredict
 
 
   // ---- combinational: this cycle's outputs ----
@@ -71,20 +101,36 @@ module rob #(
     n_disp    = 0;
     n_commit  = 0;
     halt_seen = `FALSE;
+    flush = `FALSE;
+    redirect_pc = '0;
     for (int i = 0; i < W; i++) begin
       disp_idx[i] = PTR_W'((int'(tail_ptr) + n_disp) % ROB_SZ);
       commit_idx = PTR_W'((int'(head_ptr) + i) % ROB_SZ);
       commit_valid[i] = (n_commit == i)  // all older slots committed
       && (i < int'(rob_count))  // entry is occupied
       && rob_map[commit_idx].done
-      && !halt_seen;  // nothing commits after a halt
-      commit_dest_valid[i] = commit_valid[i] && rob_map[commit_idx].dest_valid;
+      && !halt_seen  // nothing commits after a halt or a mispredict
+      && !commit_stop;
+      commit_exception[i] = commit_valid[i] ? rob_map[commit_idx].exception : EXC_NONE;
+      commit_dest_valid[i] = commit_valid[i] && rob_map[commit_idx].dest_valid
+                          && rob_map[commit_idx].exception == EXC_NONE;
       commit_rd[i] = rob_map[commit_idx].rd;
       commit_tag[i] = rob_map[commit_idx].tag;
       commit_told[i] = rob_map[commit_idx].told;
       commit_pc[i] = rob_map[commit_idx].pc;
+      commit_is_br[i] = commit_valid[i] && rob_map[commit_idx].is_br
+                     && rob_map[commit_idx].exception == EXC_NONE;
+      commit_uncond[i] = rob_map[commit_idx].uncond;
+      commit_is_call[i] = commit_is_br[i] && rob_map[commit_idx].is_call;
+      commit_is_ret[i] = commit_is_br[i] && rob_map[commit_idx].is_ret;
+      commit_next_pc[i] = rob_map[commit_idx].next_pc;
       commit_halt[i] = commit_valid[i] && rob_map[commit_idx].halt;
-      halt_seen = halt_seen || commit_halt[i];
+      if (commit_valid[i] && rob_map[commit_idx].exception == EXC_NONE
+          && rob_map[commit_idx].next_pc != rob_map[commit_idx].pred_npc) begin
+        flush = `TRUE;
+        redirect_pc = rob_map[commit_idx].next_pc;
+      end
+      halt_seen = halt_seen || commit_halt[i] || flush || commit_exception[i] != EXC_NONE;
       n_disp += int'(disp_valid[i]);
       n_commit += int'(commit_valid[i]);
     end
@@ -102,20 +148,37 @@ module rob #(
       for (int i = 0; i < W; i++)
       if (disp_valid[i])
         rob_map[disp_idx[i]] <= '{
-            done: 1'b0,
+            done: disp_exception[i] != EXC_NONE,   // nothing to execute
             dest_valid: disp_dest_valid[i],
             rd: disp_rd[i],
             tag: disp_tag[i],
             told: disp_told[i],
             pc: disp_pc[i],
-            halt: disp_halt[i]
+            halt: disp_halt[i],
+            pred_npc: disp_pred_npc[i],
+            next_pc: disp_pc[i] + 4,  // non-branches; branches overwrite at complete
+            exception: disp_exception[i],
+            is_br: disp_is_br[i],
+            uncond: disp_uncond[i],
+            is_call: disp_is_call[i],
+            is_ret: disp_is_ret[i]
         };
       head_ptr  <= PTR_W'((int'(head_ptr) + n_commit) % ROB_SZ);
-      tail_ptr  <= PTR_W'((int'(tail_ptr) + n_disp) % ROB_SZ);
-      rob_count <= $bits(rob_count)'(int'(rob_count) + n_disp - n_commit);
+      if (flush) begin
+        // squash everything younger than the committing mispredict
+        tail_ptr  <= PTR_W'((int'(head_ptr) + n_commit) % ROB_SZ);
+        rob_count <= '0;
+      end else begin
+        tail_ptr  <= PTR_W'((int'(tail_ptr) + n_disp) % ROB_SZ);
+        rob_count <= $bits(rob_count)'(int'(rob_count) + n_disp - n_commit);
+      end
 
       for (int cdb_idx = 0; cdb_idx < CDB_SZ; cdb_idx++)
-      if (cdb_valid[cdb_idx]) rob_map[cdb_rob_idx[cdb_idx]].done <= `TRUE;
+      if (cdb_valid[cdb_idx]) begin
+        rob_map[cdb_rob_idx[cdb_idx]].done <= `TRUE;
+        if (cdb_branch[cdb_idx]) rob_map[cdb_rob_idx[cdb_idx]].next_pc <= cdb_next_pc[cdb_idx];
+        if (cdb_misaligned[cdb_idx]) rob_map[cdb_rob_idx[cdb_idx]].exception <= EXC_MISALIGNED;
+      end
     end
   end
 

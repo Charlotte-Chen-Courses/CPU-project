@@ -12,8 +12,8 @@
 //                 its port, issued once, and unchanged apart from     //
 //                 ready bits; and no lost issue: at most ISSUE_WIDTH  //
 //                 issue per cycle, FU types served FP > MULT > LOAD > //
-//                 STORE > ALU, each type taking min(#ready, #free     //
-//                 ports, slots left). Directed                        //
+//                 STORE > BRANCH > ALU, each type taking min(#ready,  //
+//                 #free ports, slots left). Directed                  //
 //                 tests cover wakeup timing, same-cycle dispatch+CDB  //
 //                 bypass, fu_ready backpressure, and fill/reuse; then //
 //                 random traffic and a final drain (every dispatched  //
@@ -41,6 +41,7 @@ module testbench;
     logic                    space_ok;
     logic [C-1:0]            cdb_valid;
     logic [C-1:0][TAG_W-1:0] cdb_tag;
+    logic                    flush;
     logic [NFU-1:0]          fu_ready;
     logic [NFU-1:0]          issue_valid;
     RS_PACKET [NFU-1:0]      issue_pkt;
@@ -53,6 +54,7 @@ module testbench;
         .space_ok   (space_ok),
         .cdb_valid  (cdb_valid),
         .cdb_tag    (cdb_tag),
+        .flush      (flush),
         .fu_ready   (fu_ready),
         .issue_valid(issue_valid),
         .issue_pkt  (issue_pkt)
@@ -63,8 +65,9 @@ module testbench;
     // same port -> FU type mapping as the RS
     function automatic FU_TYPE port_type(input int f);
         if (f < `NUM_FU_ALU) return FU_ALU;
-        if (f < `NUM_FU_ALU + `NUM_FU_MULT) return FU_MULT;
-        if (f < `NUM_FU_ALU + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH) return FU_BRANCH;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT) return FU_MULT;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
         if (f < `NUM_FU - `NUM_FU_FP) return FU_STORE;
         return FU_FP;
     endfunction
@@ -83,7 +86,7 @@ module testbench;
     inst_t m [$];                  // in-flight instructions
     bit    outstanding [NTAG];     // tag will be broadcast later (sources may wait on it)
     int    next_id = 0;
-    int    errors = 0, n_disp = 0, n_issued = 0;
+    int    errors = 0, n_disp = 0, n_issued = 0, n_squashed = 0;
     int    cycle = 0, max_wait = 0;  // longest ready-to-issue wait (lowest-index select can starve)
     bit    seen [int];             // ids ever issued (catches double issue across cycles)
 
@@ -102,7 +105,7 @@ module testbench;
 
     task automatic idle();
         disp_valid = '0; disp_pkt = '0;
-        cdb_valid  = '0; cdb_tag  = '0;
+        cdb_valid  = '0; cdb_tag  = '0; flush = 0;
         fu_ready   = '1;
     endtask
 
@@ -200,7 +203,7 @@ module testbench;
         // FP > MULT > LOAD > STORE > ALU; each takes min(ready, free ports, slots left)
         begin
             automatic int left = ISSUE_W;
-            automatic FU_TYPE order [] = '{FU_FP, FU_MULT, FU_LOAD, FU_STORE, FU_ALU};
+            automatic FU_TYPE order [] = '{FU_FP, FU_MULT, FU_LOAD, FU_STORE, FU_BRANCH, FU_ALU};
             foreach (order[o]) begin
                 automatic FU_TYPE t = order[o];
                 automatic int expect_n;
@@ -223,6 +226,15 @@ module testbench;
                 m.delete(j);
                 n_issued++;
             end
+        if (flush) begin
+            n_squashed += m.size();
+            for (int i = 0; i < W; i++) if (disp_valid[i]) begin n_squashed++; n_disp++; end
+            m.delete();
+            for (int k = 0; k < C; k++) if (cdb_valid[k]) outstanding[cdb_tag[k]] = 0;
+            cycle++;
+            @(negedge clock);
+            return;
+        end
         // 2) CDB wakes the remaining entries; broadcast tags are no longer outstanding
         for (int k = 0; k < C; k++)
             if (cdb_valid[k]) begin
@@ -359,8 +371,24 @@ module testbench;
         step("reuse");
         drain("drain reuse");
 
-        // 7) random traffic
-        $display("Test 7: 20000 random cycles");
+        // 7) flush: a full RS empties; nothing it held ever issues; slots are reusable
+        $display("Test 7: flush squashes every entry");
+        for (int n = 0; space_ok && n < 4 * SZ; n++) begin
+            idle();
+            for (int i = 0; i < W; i++) disp(i, make_pkt(served[$urandom_range(0, served.size()-1)], 1, 0));
+            step("fill for flush");
+        end
+        idle(); flush = 1;
+        step("flush");
+        idle(); fu_ready = '1;
+        for (int c = 0; c < 3; c++) begin idle(); step("after flush: must be empty"); end
+        if (!space_ok) fail("RS not empty after flush");
+        idle(); for (int i = 0; i < W; i++) disp(i, make_pkt(FU_ALU, 1, 1));
+        step("reuse after flush");
+        drain("drain after flush");
+
+        // 8) random traffic
+        $display("Test 8: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
             bit found;
             idle();
@@ -380,13 +408,15 @@ module testbench;
                     if ($urandom % 3 != 0)
                         disp(i, make_pkt(served[$urandom_range(0, served.size()-1)],
                                          1'($urandom % 2), 1'($urandom % 2)));
+            flush = ($urandom % 100 == 0);
             step("random");
         end
 
-        // 8) drain: everything dispatched issues exactly once
-        $display("Test 8: drain");
+        // 9) drain: everything dispatched issues exactly once (or was squashed)
+        $display("Test 9: drain");
         drain("final drain");
-        if (n_issued != n_disp) fail($sformatf("dispatched %0d, issued %0d", n_disp, n_issued));
+        if (n_issued + n_squashed != n_disp)
+            fail($sformatf("dispatched %0d, issued %0d, squashed %0d", n_disp, n_issued, n_squashed));
 
         $display("  (%0d instructions dispatched and issued, FU ports: %0d)", n_disp, NFU);
         $display("  (longest ready-to-issue wait: %0d cycles)", max_wait);

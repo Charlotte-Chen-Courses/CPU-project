@@ -24,7 +24,8 @@ module testbench;
     logic                       clock, reset;
     logic [W-1:0]               alloc_req, free_en;
     logic [W-1:0][TAG_W-1:0]    alloc_tag, free_tag;
-    logic                       alloc_ok;
+    logic                       alloc_ok, can_alloc_w;
+    logic                       flush;
 
     freelist dut (
         .clock    (clock),
@@ -33,7 +34,9 @@ module testbench;
         .alloc_tag(alloc_tag),
         .alloc_ok (alloc_ok),
         .free_en  (free_en),
-        .free_tag (free_tag)
+        .free_tag (free_tag),
+        .can_alloc_w(can_alloc_w),
+        .flush    (flush)
     );
 
     always #5 clock = ~clock;
@@ -97,6 +100,95 @@ module testbench;
         @(negedge clock);
     endtask
 
+
+    // ---- core-like model, for flush ----
+    // In the core, tags are allocated in program order and each commit frees the OLD tag of
+    // the oldest in-flight allocation; a flush squashes every in-flight allocation. The
+    // random-free model above does not follow that order, so flush is tested here.
+    typedef struct { int tag; int told; int rd; } inflight_t;
+    inflight_t q[$];          // in-flight allocations, oldest first
+    int spec_map [32], arch_map [32];
+    int n_flushes = 0;
+
+    task automatic core_reset();
+        reset = 1; flush = 0; alloc_req = '0; free_en = '0; free_tag = '0;
+        @(negedge clock); @(negedge clock);
+        reset = 0;
+        model_reset();
+        q.delete();
+        for (int r = 0; r < 32; r++) begin spec_map[r] = r; arch_map[r] = r; end
+    endtask
+
+    // every physical register except p0 is in exactly one place: free list, in flight, or arch
+    task automatic check_conservation(input string what);
+        int count [`PHYS_REG_SZ];
+        foreach (count[t]) count[t] = 0;
+        foreach (free_q[i]) count[free_q[i]]++;
+        foreach (q[i]) count[q[i].tag]++;
+        for (int r = 1; r < 32; r++) count[arch_map[r]]++;
+        for (int t = 1; t < `PHYS_REG_SZ; t++)
+            if (count[t] != 1) fail($sformatf("[%s] p%0d counted %0d times", what, t, count[t]));
+        if (int'(dut.free_count) != free_q.size())
+            fail($sformatf("[%s] free_count=%0d, model %0d", what, dut.free_count, free_q.size()));
+    endtask
+
+    // one cycle: n_req allocations (if they fit), n_commit commits of the oldest, optional flush
+    task automatic core_step(input logic [W-1:0] req, input int n_commit, input bit do_flush,
+                             input string what);
+        int n_req = $countones(req), k = 0;
+        bit exp_ok;
+        int frees [$];
+        if (n_commit > q.size()) n_commit = q.size();
+        if (n_commit > W) n_commit = W;
+        alloc_req = req; flush = do_flush; free_en = '0; free_tag = '0;
+        for (int j = 0; j < n_commit; j++) begin
+            free_en[j] = 1; free_tag[j] = TAG_W'(q[j].told); frees.push_back(q[j].told);
+        end
+        #1;
+        exp_ok = (free_q.size() >= n_req);
+        if (can_alloc_w !== (free_q.size() >= W))
+            fail($sformatf("[%s] can_alloc_w=%b with %0d free", what, can_alloc_w, free_q.size()));
+        if (alloc_ok !== exp_ok)
+            fail($sformatf("[%s] alloc_ok=%b expected %b (free=%0d req=%b)", what, alloc_ok, exp_ok, free_q.size(), req));
+        for (int i = 0; i < W; i++)
+            if (exp_ok && req[i]) begin
+                if (int'(alloc_tag[i]) != free_q[k])
+                    fail($sformatf("[%s] slot %0d got p%0d expected p%0d", what, i, alloc_tag[i], free_q[k]));
+                k++;
+            end
+        @(posedge clock);
+        // commits: oldest first, update architectural map
+        for (int j = 0; j < n_commit; j++) begin
+            arch_map[q[0].rd] = q[0].tag;
+            void'(q.pop_front());
+        end
+        if (do_flush) begin
+            // ring after the rewind: squashed in-flight tags (allocation order), then the
+            // old free list, then this cycle's frees
+            int nq [$];
+            foreach (q[i]) nq.push_back(q[i].tag);
+            foreach (free_q[i]) nq.push_back(free_q[i]);
+            foreach (frees[i]) nq.push_back(frees[i]);
+            free_q = nq;
+            q.delete();
+            spec_map = arch_map;
+            n_flushes++;
+        end else begin
+            if (exp_ok)
+                for (int i = 0; i < W; i++)
+                    if (req[i]) begin
+                        automatic int rd = $urandom_range(1, 31);
+                        automatic int t = free_q.pop_front();
+                        q.push_back('{tag: t, told: spec_map[rd], rd: rd});
+                        spec_map[rd] = t;
+                    end
+            foreach (frees[i]) free_q.push_back(frees[i]);
+        end
+        @(negedge clock);
+        alloc_req = '0; free_en = '0; free_tag = '0; flush = 0;
+        check_conservation(what);
+    endtask
+
     // a real core can only free tags that are currently handed out
     function automatic int room();
         return SZ - free_q.size();
@@ -119,7 +211,7 @@ module testbench;
     initial begin
         clock = 0;
         reset = 1;
-        alloc_req = '0; free_en = '0; free_tag = '0;
+        alloc_req = '0; free_en = '0; free_tag = '0; flush = 0;
         foreach (none[j]) none[j] = 0;
         model_reset();
         @(negedge clock);
@@ -198,6 +290,28 @@ module testbench;
 
         if (free_q.size() + held.size() != `PHYS_REG_SZ - 1)
             fail($sformatf("tag conservation: free=%0d held=%0d", free_q.size(), held.size()));
+
+        // 7) flush, directed (core-like order)
+        $display("Test 7: flush rewinds every uncommitted tag (directed)");
+        core_reset();
+        for (int c = 0; c < 5; c++) core_step('1, 0, 0, "alloc");
+        core_step('0, 0, 1, "flush, no frees");
+        for (int c = 0; c < 8; c++) core_step('1, 0, 0, "alloc again");
+        core_step('0, W, 1, "flush with W frees in the same cycle");
+        while (free_q.size() >= W) core_step('1, 0, 0, "drain the list");
+        core_step('0, 1, 1, "flush with the list nearly empty");
+        core_step('0, 0, 1, "back-to-back flush");
+        core_step('1, 0, 0, "alloc after flushes");
+
+        // 8) flush, random (core-like order)
+        $display("Test 8: 20000 random cycles with commits and flushes");
+        core_reset();
+        for (int c = 0; c < 20000; c++) begin
+            automatic bit f = ($urandom % 40 == 0);
+            core_step(f ? '0 : W'($urandom), $urandom_range(0, W), f, "random");
+            if (errors > 20) break;
+        end
+        $display("  (%0d flushes)", n_flushes);
 
         if (errors == 0) $display("@@@ Passed");
         else             $display("@@@ Failed (%0d errors)", errors);

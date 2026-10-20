@@ -55,6 +55,7 @@ module alu_fu (
     output logic      out_valid,
     output CDB_PACKET out_pkt,
     input             out_grant,
+    input             flush,      // mispredict: drop any result (it belongs to a squashed instr)
 
     input [`XLEN-1:0] rs1_value,  // operands read from the PRF
     input [`XLEN-1:0] rs2_value
@@ -104,11 +105,12 @@ module alu_fu (
 
 
   always_ff @(posedge clock) begin
-    if (reset) out_valid <= `FALSE;
+    if (reset || flush) out_valid <= `FALSE;
     else if (ready) begin
       out_valid <= in_valid;
       if (in_valid)
-        out_pkt <= '{tag: in_pkt.dest_tag, value: alu_result, rob_idx: in_pkt.rob_idx};
+        out_pkt <= '{tag: in_pkt.dest_tag, value: alu_result, rob_idx: in_pkt.rob_idx,
+                     branch: `FALSE, next_pc: '0, misaligned: `FALSE};
     end
     // else: holding a result that lost arbitration — keep it
   end

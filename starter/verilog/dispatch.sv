@@ -20,12 +20,18 @@
 //                  - RS dest_tag = dest_valid ? new tag : p0.         //
 //                  - slots younger than a WFI in the bundle are       //
 //                    dropped (never enter the ROB).                   //
-//                 First-slice restriction: only integer ALU ops and   //
-//                 WFI may dispatch (simulation assertion below).      //
+//                  - flush (mispredict at commit): no dispatch; the   //
+//                    freelist rewinds, the RAT loads recover_map, the //
+//                    busy table clears.                               //
+//                 Anything else (illegal, or no unit yet: load/store, //
+//                 mult, FP, CSR, A) gets a ROB entry that is done at  //
+//                 dispatch with an exception and no destination, and  //
+//                 never enters the RS; the ROB raises it at commit.   //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
 `include "verilog/sys_defs.svh"
+`include "verilog/ISA.svh"
 
 module dispatch #(
     localparam W         = `SUPERSCALAR_WIDTH,
@@ -40,6 +46,7 @@ module dispatch #(
     input        [W-1:0]                  in_valid,
     input  INST  [W-1:0]                  in_inst,
     input        [W-1:0][`XLEN-1:0]       in_pc,
+    input        [W-1:0][`XLEN-1:0]       in_pred_npc,   // next PC fetch predicted for each slot
     output logic                          fire,          // bundle accepted: fetch may advance
 
     // back-pressure (state-only signals from the ROB and RS)
@@ -55,8 +62,15 @@ module dispatch #(
     output logic [W-1:0][TAG_W-1:0]       disp_told,
     output logic [W-1:0][`XLEN-1:0]       disp_pc,
     output logic [W-1:0]                  disp_halt,
+    output EXCEPTION [W-1:0]              disp_exception,  // != EXC_NONE: ROB entry is done at dispatch
+    output logic [W-1:0]                  disp_is_br,      // branch / jump (trains the predictor at commit)
+    output logic [W-1:0]                  disp_uncond,     // jal / jalr
+    output logic [W-1:0]                  disp_is_call,    // jal/jalr, rd = x1/x5
+    output logic [W-1:0]                  disp_is_ret,     // jalr x0, x1/x5
+    output logic [W-1:0][`XLEN-1:0]       disp_pred_npc,
 
-    // to the RS (slot i is valid when disp_valid[i])
+    // to the RS: only slots that have a functional unit to run on
+    output logic [W-1:0]                  rs_disp_valid,
     output RS_PACKET [W-1:0]              disp_pkt,
 
     // CDB: clears busy bits
@@ -65,7 +79,11 @@ module dispatch #(
 
     // commit: frees old physical registers
     input        [W-1:0]                  free_en,
-    input        [W-1:0][TAG_W-1:0]       free_tag
+    input        [W-1:0][TAG_W-1:0]       free_tag,
+
+    // mispredict recovery (this cycle): no dispatch; restore rename state
+    input                                 flush,
+    input        [`ARCH_REG_SZ-1:0][TAG_W-1:0] recover_map   // retirement map after this cycle's commits
 );
 
   // ---- decode ----
@@ -114,16 +132,31 @@ module dispatch #(
       for (int j = 0; j < i; j++) if (in_valid[j] && halt[j]) slot_valid[i] = `FALSE;
     end
 
+  // ---- instructions this core cannot run yet: they get a ROB entry with an exception (done at
+  //      dispatch, no destination, never in the RS). Raised only if they reach commit, so code on
+  //      a mispredicted path never stops the machine. ----
+  logic [W-1:0] unsupported, has_dest_eff;
+  EXCEPTION [W-1:0] exc;
+  always_comb
+    for (int i = 0; i < W; i++) begin
+      unsupported[i] = !((fu_type[i] == FU_ALU && !cond_branch[i] && !uncond_branch[i]) ||
+                         (fu_type[i] == FU_BRANCH && (cond_branch[i] || uncond_branch[i]))) ||
+                       rd_mem[i] || wr_mem[i] || csr_op[i] || atomic[i] ||
+                       rs1_fp[i] || rs2_fp[i] || rd_fp[i] || rs3_used[i];
+      exc[i]          = illegal[i] ? EXC_ILLEGAL : unsupported[i] ? EXC_UNSUPPORTED : EXC_NONE;
+      has_dest_eff[i] = has_dest[i] && (exc[i] == EXC_NONE);
+    end
+
   // ---- rename control ----
   logic             can_alloc_w;
   logic [W-1:0]     dest_valid;
   logic [W-1:0][TAG_W-1:0] new_tag, src1_tag, src2_tag, told;
   logic [W-1:0]     src1_bypassed, src2_bypassed, src1_free, src2_free;
 
-  assign fire = (|slot_valid) && can_alloc_w && rob_space_ok && rs_space_ok;
+  assign fire = (|slot_valid) && can_alloc_w && rob_space_ok && rs_space_ok && !flush;
 
   always_comb
-    for (int i = 0; i < W; i++) dest_valid[i] = slot_valid[i] && has_dest[i] && (rd[i] != '0);
+    for (int i = 0; i < W; i++) dest_valid[i] = slot_valid[i] && has_dest_eff[i] && (rd[i] != '0);
 
   freelist freelist_0 (
       .clock      (clock),
@@ -135,7 +168,8 @@ module dispatch #(
       /* verilator lint_on PINCONNECTEMPTY */
       .can_alloc_w(can_alloc_w),
       .free_en    (free_en),
-      .free_tag   (free_tag)
+      .free_tag   (free_tag),
+      .flush      (flush)
   );
 
   rat rat_0 (
@@ -146,13 +180,15 @@ module dispatch #(
       .rs1          (rs1),
       .rs2          (rs2),
       .rd           (rd),
-      .has_dest     (has_dest),
+      .has_dest     (has_dest_eff),
       .new_tag      (new_tag),
       .src1_tag     (src1_tag),
       .src2_tag     (src2_tag),
       .told         (told),
       .src1_bypassed(src1_bypassed),
-      .src2_bypassed(src2_bypassed)
+      .src2_bypassed(src2_bypassed),
+      .recover      (flush),
+      .recover_map  (recover_map)
   );
 
   busy_table busy_table_0 (
@@ -162,6 +198,7 @@ module dispatch #(
       .set_tag   (new_tag),
       .cdb_valid (cdb_valid),
       .cdb_tag   (cdb_tag),
+      .flush     (flush),
       .src1_tag  (src1_tag),
       .src2_tag  (src2_tag),
       .src1_ready(src1_free),
@@ -172,12 +209,21 @@ module dispatch #(
   always_comb begin
     for (int i = 0; i < W; i++) begin
       disp_valid[i]      = slot_valid[i] && fire;
+      rs_disp_valid[i]   = disp_valid[i] && (exc[i] == EXC_NONE);
+      disp_exception[i]  = exc[i];
       disp_dest_valid[i] = dest_valid[i];
       disp_rd[i]         = rd[i];
       disp_tag[i]        = new_tag[i];
       disp_told[i]       = told[i];
       disp_pc[i]         = in_pc[i];
       disp_halt[i]       = halt[i];
+      disp_is_br[i]      = cond_branch[i] || uncond_branch[i];
+      disp_uncond[i]     = uncond_branch[i];
+      // RISC-V return-address-stack hints: link registers are x1 and x5
+      disp_is_call[i]    = uncond_branch[i] && (rd[i] == 5'd1 || rd[i] == 5'd5);
+      disp_is_ret[i]     = uncond_branch[i] && in_inst[i][6:0] == `RV32_JALR_OP && rd[i] == 5'd0
+                           && (rs1[i] == 5'd1 || rs1[i] == 5'd5);
+      disp_pred_npc[i]   = in_pred_npc[i];
 
       disp_pkt[i]            = '0;
       disp_pkt[i].inst       = in_inst[i];
@@ -195,19 +241,5 @@ module dispatch #(
       disp_pkt[i].opb_select = opb_select[i];
     end
   end
-
-  // ---- first-slice restriction: fail loudly on anything the core cannot run yet ----
-  // (branches/jumps would silently write their target to rd; loads/stores/mult/FP have
-  //  no FU port and would sit in the RS forever)
-  // synopsys translate_off
-  always_ff @(posedge clock)
-    if (!reset)
-      for (int i = 0; i < W; i++)
-        if (disp_valid[i])
-          assert (!illegal[i] && fu_type[i] == FU_ALU && !cond_branch[i] && !uncond_branch[i] &&
-                  !rd_mem[i] && !wr_mem[i] && !csr_op[i] && !atomic[i] &&
-                  !rs1_fp[i] && !rs2_fp[i] && !rd_fp[i] && !rs3_used[i])
-          else $error("dispatch: unsupported instruction %h at PC %h (slot %0d)", in_inst[i], in_pc[i], i);
-  // synopsys translate_on
 
 endmodule  // dispatch

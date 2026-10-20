@@ -4,7 +4,7 @@
 //                                                                     //
 //  Description :  Testbench for the CDB arbiter (combinational). The  //
 //                 model sorts the requesting ports by (FU-type rank,  //
-//                 port number) with FP > MULT > LOAD > STORE > ALU,   //
+//                 port number), FP>MULT>LOAD>STORE>BRANCH>ALU,        //
 //                 grants the first NUM_CDB, and puts them on lanes in //
 //                 that order. Checks fu_grant, every lane's valid and //
 //                 packet, unused lanes idle, and at most NUM_CDB      //
@@ -39,8 +39,9 @@ module testbench;
 
     function automatic FU_TYPE port_type(input int f);
         if (f < `NUM_FU_ALU) return FU_ALU;
-        if (f < `NUM_FU_ALU + `NUM_FU_MULT) return FU_MULT;
-        if (f < `NUM_FU_ALU + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH) return FU_BRANCH;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT) return FU_MULT;
+        if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
         if (f < `NUM_FU - `NUM_FU_FP) return FU_STORE;
         return FU_FP;
     endfunction
@@ -52,7 +53,8 @@ module testbench;
             FU_MULT:  return 1;
             FU_LOAD:  return 2;
             FU_STORE: return 3;
-            default:  return 4;
+            FU_BRANCH: return 4;
+            default:  return 5;
         endcase
     endfunction
 
@@ -66,7 +68,7 @@ module testbench;
         logic [NFU-1:0] exp_grant = '0;
         #1;
         // requesting ports sorted by (rank, port)
-        for (int r = 0; r <= 4; r++)
+        for (int r = 0; r <= 5; r++)
             for (int f = 0; f < NFU; f++)
                 if (fu_valid[f] && rank(port_type(f)) == r) order.push_back(f);
         for (int k = 0; k < C; k++) begin
@@ -96,8 +98,8 @@ module testbench;
     endtask
 
     initial begin
-        $display("Ports: %0d (ALU %0d, MULT %0d, LOAD %0d, STORE %0d, FP %0d), CDBs: %0d",
-                 NFU, `NUM_FU_ALU, `NUM_FU_MULT, `NUM_FU_LOAD, `NUM_FU_STORE, `NUM_FU_FP, C);
+        $display("Ports: %0d (ALU %0d, BRANCH %0d, MULT %0d, LOAD %0d, STORE %0d, FP %0d), CDBs: %0d",
+                 NFU, `NUM_FU_ALU, `NUM_FU_BRANCH, `NUM_FU_MULT, `NUM_FU_LOAD, `NUM_FU_STORE, `NUM_FU_FP, C);
 
         // 1) nobody requests: nothing granted, lanes idle
         $display("Test 1: no requests");

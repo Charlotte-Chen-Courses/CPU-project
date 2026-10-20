@@ -26,6 +26,7 @@ module testbench;
     logic             out_valid;
     CDB_PACKET        out_pkt;
     logic             out_grant;
+    logic             flush;
     logic [`XLEN-1:0] rs1_value, rs2_value;
 
     alu_fu dut (
@@ -37,6 +38,7 @@ module testbench;
         .out_valid(out_valid),
         .out_pkt  (out_pkt),
         .out_grant(out_grant),
+        .flush    (flush),
         .rs1_value(rs1_value),
         .rs2_value(rs2_value)
     );
@@ -99,7 +101,7 @@ module testbench;
 
     task automatic idle();
         in_valid = 0; in_pkt = '0; rs1_value = '0; rs2_value = '0;
-        out_grant = 1;
+        out_grant = 1; flush = 0;
     endtask
 
     // random operand: mostly random, sometimes an edge value
@@ -144,11 +146,12 @@ module testbench;
                            m_pkt.tag, m_pkt.value, m_pkt.rob_idx));
         if (m_valid && out_grant) n_results++;
         @(posedge clock);
-        if (!m_valid || out_grant) begin
+        if (flush) m_valid = 0;        // flush drops a held result and the one being captured
+        else if (!m_valid || out_grant) begin
             m_valid = in_valid;
             if (in_valid)
                 m_pkt = '{tag: in_pkt.dest_tag, value: model(in_pkt, rs1_value, rs2_value),
-                          rob_idx: in_pkt.rob_idx};
+                          rob_idx: in_pkt.rob_idx, branch: 0, next_pc: '0, misaligned: 0};
         end
         @(negedge clock);
     endtask
@@ -209,8 +212,15 @@ module testbench;
                 fail($sformatf("back-to-back: %0d results in 100 cycles", n_results - start_n));
         end
 
-        // 6) random: random func/selects, random in_valid and out_grant
-        $display("Test 6: 20000 random cycles");
+        // 6) flush drops a held result and the one being captured
+        $display("Test 6: flush");
+        idle(); issue(ALU_ADD, OPA_IS_RS1, OPB_IS_RS2); step("issue");
+        idle(); issue(ALU_ADD, OPA_IS_RS1, OPB_IS_RS2); out_grant = 0; step("held");
+        idle(); issue(ALU_ADD, OPA_IS_RS1, OPB_IS_RS2); out_grant = 0; flush = 1; step("flush");
+        idle(); step("after flush");
+
+        // 7) random: random func/selects, random in_valid, out_grant and flush
+        $display("Test 7: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
             idle();
             if ($urandom % 4 != 0)
@@ -218,6 +228,7 @@ module testbench;
                       opas[$urandom_range(0, opas.size() - 1)],
                       opbs[$urandom_range(0, opbs.size() - 1)]);
             out_grant = ($urandom % 4 != 0);
+            flush     = ($urandom % 50 == 0);
             step("random");
         end
         idle(); step("drain");

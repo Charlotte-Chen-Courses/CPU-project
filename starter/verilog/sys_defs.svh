@@ -39,45 +39,61 @@
 
 
 // worry about these later
-`define BRANCH_PRED_SZ xx
+// branch predictor (fetch): BTB entries and bimodal 2-bit counters (powers of 2)
+`define BTB_SZ 32
+`define BHT_SZ 256
+`define RAS_SZ 8      // return address stack depth (power of 2)
 `define LSQ_SZ xx
 
 // functional units (you should decide if you want more or fewer types of FUs)
+
+// Exception causes, raised only when the instruction reaches commit (a wrong-path one is
+// squashed by the older mispredict's flush and never reported)
+typedef enum logic [1:0] {
+  EXC_NONE        = 2'h0,
+  EXC_ILLEGAL     = 2'h1,   // decoder: not an RV32IMAF instruction
+  EXC_UNSUPPORTED = 2'h2,   // legal, but this core has no unit for it yet (load/store/mult/FP/CSR/A)
+  EXC_MISALIGNED  = 2'h3    // taken branch / jump target not 4-byte aligned
+} EXCEPTION;
 
 typedef enum logic [2:0] {
   FU_ALU,
   FU_MULT,
   FU_LOAD,
   FU_STORE,
-  FU_FP
+  FU_FP,
+  FU_BRANCH   // cond branches, jal, jalr (appended: existing encodings unchanged)
 } FU_TYPE;
 
 `define NUM_FU_ALU 1
+`define NUM_FU_BRANCH 1
 `define NUM_FU_MULT 0
 `define NUM_FU_LOAD 0
 `define NUM_FU_STORE 0
 `define NUM_FU_FP 0
-`define NUM_FU (`NUM_FU_ALU+`NUM_FU_MULT+`NUM_FU_LOAD+`NUM_FU_STORE+`NUM_FU_FP)
+`define NUM_FU (`NUM_FU_ALU+`NUM_FU_BRANCH+`NUM_FU_MULT+`NUM_FU_LOAD+`NUM_FU_STORE+`NUM_FU_FP)
 
 // Ports (RS issue ports = FU instances = CDB-arbiter inputs) are grouped by FU type in
-// this order: ALU, MULT, LOAD, STORE, FP. Shared by rs.sv and cdb_arbiter.sv.
+// this order: ALU, BRANCH, MULT, LOAD, STORE, FP. Shared by rs.sv, cdb_arbiter.sv, cpu.sv.
 function automatic FU_TYPE port_type(input int f);
   if (f < `NUM_FU_ALU) return FU_ALU;
-  if (f < `NUM_FU_ALU + `NUM_FU_MULT) return FU_MULT;
-  if (f < `NUM_FU_ALU + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
+  if (f < `NUM_FU_ALU + `NUM_FU_BRANCH) return FU_BRANCH;
+  if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT) return FU_MULT;
+  if (f < `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_LOAD) return FU_LOAD;
   if (f < `NUM_FU - `NUM_FU_FP) return FU_STORE;
   return FU_FP;
 endfunction
 
 // Priority between FU types (RS issue when slots run out, CDB arbitration):
-// longest latency first. Rank 0 is served first.
-`define NUM_FU_RANKS 5
+// longest latency first, then branches (resolve early), then ALU. Rank 0 is served first.
+`define NUM_FU_RANKS 6
 function automatic FU_TYPE rank_type(input int r);
   case (r)
     0:       return FU_FP;
     1:       return FU_MULT;
     2:       return FU_LOAD;
     3:       return FU_STORE;
+    4:       return FU_BRANCH;
     default: return FU_ALU;
   endcase
 endfunction
@@ -412,6 +428,13 @@ typedef struct packed {
   logic [`TAG_W-1:0] told;
   logic [`XLEN-1:0]  pc;          // commit trace / mispredict redirect
   logic              halt;        // WFI: stop at commit
+  logic [`XLEN-1:0]  pred_npc;    // next PC fetch predicted (set at dispatch)
+  logic [`XLEN-1:0]  next_pc;     // actual next PC: PC+4 at dispatch, branches overwrite at complete
+  EXCEPTION          exception;   // reported at commit
+  logic              is_br;       // conditional branch, jal or jalr: trains the predictor at commit
+  logic              uncond;      // jal / jalr
+  logic              is_call;     // jal/jalr with rd = x1/x5 (RAS push)
+  logic              is_ret;      // jalr x0, x1/x5 (RAS pop)
 } ROB_PACKET;
 
 
@@ -449,6 +472,9 @@ typedef struct packed {
   logic [`TAG_W-1:0]     tag;      // dest_tag (p0 = no destination)
   logic [`XLEN-1:0]      value;
   logic [`ROB_IDX_W-1:0] rob_idx;
+  logic                  branch;   // result of a branch/jump: next_pc is valid
+  logic [`XLEN-1:0]      next_pc;  // actual next PC (branches only)
+  logic                  misaligned; // branch/jump: taken target not 4-byte aligned
 } CDB_PACKET;
 
 

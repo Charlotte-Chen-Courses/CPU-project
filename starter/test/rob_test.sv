@@ -30,6 +30,15 @@ module testbench;
     logic [W-1:0][TAG_W-1:0] disp_tag, disp_told;
     logic [W-1:0][`XLEN-1:0] disp_pc, commit_pc;
     logic [W-1:0]            disp_halt, commit_halt;
+    logic [W-1:0][`XLEN-1:0] disp_pred_npc;
+    logic [C-1:0]            cdb_branch, cdb_misaligned;
+    EXCEPTION [W-1:0]        disp_exception, commit_exception;
+    logic [W-1:0]            disp_is_br, disp_uncond, commit_is_br, commit_uncond;
+    logic [W-1:0]            disp_is_call, disp_is_ret, commit_is_call, commit_is_ret;
+    logic [W-1:0][`XLEN-1:0] commit_next_pc;
+    logic [C-1:0][`XLEN-1:0] cdb_next_pc;
+    logic                    flush;
+    logic [`XLEN-1:0]        redirect_pc;
     logic [W-1:0][PTR_W-1:0] disp_idx;
     logic                    space_ok;
     logic [C-1:0]            cdb_valid;
@@ -48,17 +57,35 @@ module testbench;
         .disp_told        (disp_told),
         .disp_pc          (disp_pc),
         .disp_halt        (disp_halt),
+        .disp_pred_npc    (disp_pred_npc),
+        .disp_exception   (disp_exception),
+        .disp_is_br       (disp_is_br),
+        .disp_uncond      (disp_uncond),
+        .disp_is_call     (disp_is_call),
+        .disp_is_ret      (disp_is_ret),
         .disp_idx         (disp_idx),
         .space_ok         (space_ok),
         .cdb_valid        (cdb_valid),
         .cdb_rob_idx      (cdb_rob_idx),
+        .cdb_branch       (cdb_branch),
+        .cdb_next_pc      (cdb_next_pc),
+        .cdb_misaligned   (cdb_misaligned),
         .commit_valid     (commit_valid),
         .commit_dest_valid(commit_dest_valid),
         .commit_rd        (commit_rd),
         .commit_tag       (commit_tag),
         .commit_told      (commit_told),
         .commit_pc        (commit_pc),
-        .commit_halt      (commit_halt)
+        .commit_is_br     (commit_is_br),
+        .commit_uncond    (commit_uncond),
+        .commit_is_call   (commit_is_call),
+        .commit_is_ret    (commit_is_ret),
+        .commit_next_pc   (commit_next_pc),
+        .commit_halt      (commit_halt),
+        .commit_exception (commit_exception),
+        .commit_stop      (1'b0),
+        .flush            (flush),
+        .redirect_pc      (redirect_pc)
     );
 
     always #5 clock = ~clock;
@@ -71,12 +98,15 @@ module testbench;
         logic [TAG_W-1:0] tag, told;
         logic [`XLEN-1:0] pc;
         bit         halt;
+        logic [`XLEN-1:0] pred_npc, next_pc;
+        EXCEPTION   exc;
+        bit         is_br, uncond, is_call, is_ret;
     } entry_t;
 
     entry_t m [SZ];
     int m_head, m_tail, m_count;
     int errors = 0;
-    int n_committed = 0;
+    int n_committed = 0, n_flushes = 0;
 
     task automatic fail(input string msg);
         $display("  FAIL: %s", msg);
@@ -89,8 +119,10 @@ module testbench;
 
     task automatic idle();
         disp_valid = '0; disp_dest_valid = '0; disp_rd = '0; disp_tag = '0; disp_told = '0;
-        disp_pc = '0; disp_halt = '0;
-        cdb_valid = '0; cdb_rob_idx = '0;
+        disp_pc = '0; disp_halt = '0; disp_pred_npc = '0;
+        cdb_valid = '0; cdb_rob_idx = '0; cdb_branch = '0; cdb_next_pc = '0; cdb_misaligned = '0;
+        disp_exception = '{default: EXC_NONE};
+        disp_is_br = '0; disp_uncond = '0; disp_is_call = '0; disp_is_ret = '0;
     endtask
 
     // set dispatch slot i with random contents
@@ -102,6 +134,11 @@ module testbench;
         disp_told[i]       = TAG_W'($urandom);
         disp_pc[i]         = $urandom;
         disp_halt[i]       = 0;
+        disp_pred_npc[i]   = disp_pc[i] + 4;     // correct unless a test changes it
+        disp_is_br[i]      = ($urandom % 4 == 0);
+        disp_uncond[i]     = disp_is_br[i] && ($urandom % 2 == 1);
+        disp_is_call[i]    = disp_uncond[i] && ($urandom % 3 == 0);
+        disp_is_ret[i]     = disp_uncond[i] && !disp_is_call[i] && ($urandom % 2 == 1);
     endtask
 
     // ROB index of the k-th oldest in-flight entry
@@ -113,6 +150,8 @@ module testbench;
     task automatic step(input string what);
         int n_disp = 0, n_com = 0;
         int idx;
+        bit exp_flush;
+        logic [`XLEN-1:0] exp_redirect;
         #1;
         if (space_ok !== (m_count <= SZ - W))
             fail($sformatf("[%s] space_ok=%b with %0d entries", what, space_ok, m_count));
@@ -126,46 +165,82 @@ module testbench;
             n_disp += int'(disp_valid[i]);
         end
 
-        // expected commits: consecutive done entries from the head, up to W,
-        // and nothing younger than a halt in the same cycle
+        // expected commits: consecutive done entries from the head, up to W, and nothing
+        // younger than a halt or a mispredict (actual next PC != predicted) in the same cycle
+        exp_flush = 0;
         for (int i = 0; i < W; i++) begin
             automatic bit halt_before = 0;
             automatic bit exp;
-            for (int j = 0; j < i; j++) if (commit_valid[j] && m[nth(j)].halt) halt_before = 1;
+            for (int j = 0; j < i; j++)
+                if (commit_valid[j] && (m[nth(j)].halt || m[nth(j)].exc != EXC_NONE ||
+                                        m[nth(j)].next_pc != m[nth(j)].pred_npc)) halt_before = 1;
             exp = (n_com == i) && (i < m_count) && m[nth(i)].done && !halt_before;
             if (commit_valid[i] !== exp)
                 fail($sformatf("[%s] slot %0d commit_valid=%b expected %b (count=%0d)",
                                what, i, commit_valid[i], exp, m_count));
             if (exp) begin
                 idx = nth(i);
-                if (commit_dest_valid[i] !== m[idx].dest_valid)
+                if (commit_exception[i] !== m[idx].exc)
+                    fail($sformatf("[%s] slot %0d rob %0d: commit_exception=%s expected %s", what, i, idx,
+                                   commit_exception[i].name(), m[idx].exc.name()));
+                if (commit_dest_valid[i] !== (m[idx].dest_valid && m[idx].exc == EXC_NONE))
                     fail($sformatf("[%s] slot %0d commit_dest_valid wrong (rob %0d)", what, i, idx));
                 if (commit_rd[i] !== m[idx].rd || commit_tag[i] !== m[idx].tag || commit_told[i] !== m[idx].told)
                     fail($sformatf("[%s] slot %0d rob %0d: got rd=%0d tag=%0d told=%0d, expected rd=%0d tag=%0d told=%0d",
                                    what, i, idx, commit_rd[i], commit_tag[i], commit_told[i],
                                    m[idx].rd, m[idx].tag, m[idx].told));
+                if (commit_is_br[i] !== (m[idx].is_br && m[idx].exc == EXC_NONE) ||
+                    (commit_is_br[i] && (commit_uncond[i] !== m[idx].uncond || commit_next_pc[i] !== m[idx].next_pc)))
+                    fail($sformatf("[%s] slot %0d rob %0d: predictor update is_br=%b uncond=%b npc=%h, expected %b %b %h",
+                                   what, i, idx, commit_is_br[i], commit_uncond[i], commit_next_pc[i],
+                                   m[idx].is_br && m[idx].exc == EXC_NONE, m[idx].uncond, m[idx].next_pc));
+                if (commit_is_call[i] !== (m[idx].is_br && m[idx].exc == EXC_NONE && m[idx].is_call) ||
+                    commit_is_ret[i]  !== (m[idx].is_br && m[idx].exc == EXC_NONE && m[idx].is_ret))
+                    fail($sformatf("[%s] slot %0d rob %0d: commit call/ret=%b%b expected %b%b", what, i, idx,
+                                   commit_is_call[i], commit_is_ret[i], m[idx].is_call, m[idx].is_ret));
                 if (commit_pc[i] !== m[idx].pc)
                     fail($sformatf("[%s] slot %0d rob %0d: commit_pc=%h expected %h", what, i, idx, commit_pc[i], m[idx].pc));
                 if (commit_halt[i] !== m[idx].halt)
                     fail($sformatf("[%s] slot %0d rob %0d: commit_halt=%b expected %b", what, i, idx, commit_halt[i], m[idx].halt));
+                if (!exp_flush && m[idx].exc == EXC_NONE && m[idx].next_pc != m[idx].pred_npc) begin
+                    exp_flush = 1; exp_redirect = m[idx].next_pc;
+                end
                 n_com++;
             end
         end
+        if (flush !== exp_flush)
+            fail($sformatf("[%s] flush=%b expected %b", what, flush, exp_flush));
+        else if (exp_flush && redirect_pc !== exp_redirect)
+            fail($sformatf("[%s] redirect_pc=%h expected %h", what, redirect_pc, exp_redirect));
 
         @(posedge clock);
         // update model: complete, dispatch, commit (complete targets occupied entries only)
-        for (int k = 0; k < C; k++) if (cdb_valid[k]) m[cdb_rob_idx[k]].done = 1;
+        for (int k = 0; k < C; k++)
+            if (cdb_valid[k]) begin
+                m[cdb_rob_idx[k]].done = 1;
+                if (cdb_branch[k]) m[cdb_rob_idx[k]].next_pc = cdb_next_pc[k];
+                if (cdb_misaligned[k]) m[cdb_rob_idx[k]].exc = EXC_MISALIGNED;
+            end
         n_disp = 0;
         for (int i = 0; i < W; i++)
             if (disp_valid[i]) begin
                 idx = (m_tail + n_disp) % SZ;
-                m[idx] = '{done: 0, dest_valid: disp_dest_valid[i], rd: disp_rd[i],
-                           tag: disp_tag[i], told: disp_told[i], pc: disp_pc[i], halt: disp_halt[i]};
+                m[idx] = '{done: disp_exception[i] != EXC_NONE, dest_valid: disp_dest_valid[i], rd: disp_rd[i],
+                           tag: disp_tag[i], told: disp_told[i], pc: disp_pc[i], halt: disp_halt[i],
+                           pred_npc: disp_pred_npc[i], next_pc: disp_pc[i] + 4, exc: disp_exception[i],
+                           is_br: disp_is_br[i], uncond: disp_uncond[i],
+                           is_call: disp_is_call[i], is_ret: disp_is_ret[i]};
                 n_disp++;
             end
-        m_tail  = (m_tail + n_disp) % SZ;
         m_head  = (m_head + n_com) % SZ;
-        m_count = m_count + n_disp - n_com;
+        if (exp_flush) begin                // everything younger is squashed
+            m_tail  = m_head;
+            m_count = 0;
+            n_flushes++;
+        end else begin
+            m_tail  = (m_tail + n_disp) % SZ;
+            m_count = m_count + n_disp - n_com;
+        end
         n_committed += n_com;
         @(negedge clock);
     endtask
@@ -174,6 +249,13 @@ module testbench;
     task automatic complete(input int p, input int k);
         cdb_valid[p] = 1;
         cdb_rob_idx[p] = PTR_W'(nth(k));
+    endtask
+
+    // complete it as a branch whose actual next PC is npc
+    task automatic complete_br(input int p, input int k, input logic [`XLEN-1:0] npc);
+        complete(p, k);
+        cdb_branch[p]  = 1;
+        cdb_next_pc[p] = npc;
     endtask
 
     // complete everything in flight (C per cycle, youngest first), then let it all commit
@@ -288,23 +370,87 @@ module testbench;
             drain("drain after halt");
         end
 
-        // 10) random traffic: random dispatch, random out-of-order completion, many wraps
-        $display("Test 10: 20000 random cycles");
+        // 10) mispredict in slot 0: it commits, the done slot 1 does not, the ROB empties
+        if (W >= 2) begin
+            $display("Test 10: mispredict in slot 0 squashes a done slot 1");
+            idle(); disp(0); disp(1);
+            step("dispatch pair");
+            idle(); complete_br(0, 0, 32'h1000); if (C > 1) complete(1, 1);
+            step("complete");
+            idle(); if (C == 1) complete(0, 1);
+            step("mispredict commits alone, flush");
+            idle(); step("empty after flush");
+
+            $display("Test 11: mispredict in slot 1: both commit, then flush");
+            idle(); disp(0); disp(1);
+            step("dispatch pair");
+            idle(); complete(0, 0); if (C > 1) complete_br(1, 1, 32'h2000);
+            step("complete");
+            idle(); if (C == 1) complete_br(0, 1, 32'h2000);
+            step("both commit, flush");
+            idle(); step("empty after flush");
+        end
+
+        // 12) mispredict at the head of a full ROB: everything behind it goes
+        $display("Test 12: mispredict while the ROB is full");
+        while (space_ok) begin idle(); for (int i = 0; i < W; i++) disp(i); step("fill"); end
+        idle(); complete_br(0, 0, 32'h3000); if (C > 1) complete(1, 1);
+        step("complete head as mispredict");
+        idle(); step("flush");
+        idle(); step("empty after flush");
+        idle(); for (int i = 0; i < W; i++) disp(i); step("dispatch after flush");
+        drain("drain after flush");
+
+        // 13) exceptions: done at dispatch, raised at commit, no destination, nothing younger, no flush
+        if (W >= 2) begin
+            $display("Test 13: exception at dispatch commits alone, writes nothing, no flush");
+            idle(); disp(0); disp_exception[0] = EXC_UNSUPPORTED; disp(1);
+            step("dispatch exception + younger");
+            idle(); complete(0, 1);
+            step("complete the younger one (the exception entry is already done)");
+            idle(); step("exception commits alone");
+            drain("drain after exception");
+
+            $display("Test 14: misaligned branch beats its own mispredict");
+            idle(); disp(0); disp(1);
+            step("dispatch pair");
+            idle(); complete_br(0, 0, 32'h4002); cdb_misaligned[0] = 1; if (C > 1) complete(1, 1);
+            step("complete misaligned");
+            idle(); if (C == 1) complete(0, 1);
+            step("exception, not flush");
+            drain("drain after misaligned");
+        end
+
+        // 15) random traffic: dispatch, out-of-order completion, mispredicts, exceptions, many wraps
+        $display("Test 15: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
             automatic int not_done[$];
             idle();
             if (space_ok)
                 for (int i = 0; i < W; i++)
-                    if ($urandom % 3 != 0) begin disp(i, ($urandom % 4) != 0); disp_halt[i] = ($urandom % 16 == 0); end
+                    if ($urandom % 3 != 0) begin
+                        disp(i, ($urandom % 4) != 0);
+                        disp_halt[i] = ($urandom % 16 == 0);
+                        if ($urandom % 8 == 0) disp_pred_npc[i] = $urandom;   // predicted a jump
+                        if ($urandom % 24 == 0) disp_exception[i] = ($urandom % 2 == 1) ? EXC_ILLEGAL : EXC_UNSUPPORTED;
+                    end
             for (int k = 0; k < m_count; k++) if (!m[nth(k)].done) not_done.push_back(k);
             not_done.shuffle();
             for (int p = 0; p < C && p < not_done.size(); p++)
-                if ($urandom % 3 != 0) complete(p, not_done[p]);
+                if ($urandom % 3 != 0) begin
+                    automatic int k = not_done[p];
+                    // a branch result: usually agrees with the prediction, sometimes not
+                    if ($urandom % 4 == 0) begin
+                        complete_br(p, k, ($urandom % 3 == 0) ? $urandom : m[nth(k)].pred_npc);
+                        cdb_misaligned[p] = ($urandom % 16 == 0);
+                    end
+                    else complete(p, k);
+                end
             step("random");
         end
         drain("final drain");
 
-        $display("  (%0d instructions committed)", n_committed);
+        $display("  (%0d instructions committed, %0d flushes)", n_committed, n_flushes);
         if (errors == 0) $display("@@@ Passed");
         else             $display("@@@ Failed (%0d errors)", errors);
         $finish;

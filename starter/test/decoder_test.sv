@@ -115,10 +115,12 @@ module testbench;
             check("add",   R(7'b0000000, 3'b000, 7'b0110011), E(FU_ALU, 1));
             check("lw",    I(3'b010, 7'b0000011), E(FU_LOAD, 1, .rm(1)));
             check("sw",    S(3'b010, 7'b0100011), E(FU_STORE, 0, .wm(1)));
-            e = E(FU_ALU, 0); e.cb = 1;
+            e = E(FU_BRANCH, 0); e.cb = 1;
             check("beq",   S(3'b000, 7'b1100011), e);
-            e = E(FU_ALU, 1); e.ub = 1;
+            check("bgeu",  S(3'b111, 7'b1100011), e);
+            e = E(FU_BRANCH, 1); e.ub = 1;
             check("jal",   {20'($urandom), 5'($urandom), 7'b1101111}, e);
+            check("jalr",  I(3'b000, 7'b1100111), e);
 
             // ---- M ----
             check("mul",    R(7'b0000001, 3'b000, 7'b0110011), E(FU_MULT, 1));
