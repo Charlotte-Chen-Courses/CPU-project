@@ -7,24 +7,26 @@
 //                 and busy table, and produces the ROB and RS entries //
 //                 for the bundle. Rules:                              //
 //                  - fire = any valid && freelist can_alloc_w &&      //
-//                    rob_space_ok && rs_space_ok. All three are       //
+//                    rob_space_ok && rs_space_ok && LQ/SQ space. All  //
 //                    state-only (never the request-dependent          //
 //                    alloc_ok), so there is no combinational loop.    //
 //                    The bundle renames whole or not at all.          //
 //                  - dest_valid = valid && has_dest && rd != x0.      //
 //                  - freelist alloc_req, busy-table set_en, RAT       //
 //                    writes and ROB/RS writes happen only on fire.    //
-//                  - src ready = busy table ready (with CDB bypass)   //
-//                    && not bypassed from an older slot in the        //
-//                    bundle (that value does not exist yet).          //
+//                  - src ready = the field is not a register          //
+//                    (rs*_used = 0: lui/auipc/jal rs1, I-type rs2,    //
+//                    ...), or busy table ready (with CDB bypass) &&   //
+//                    not bypassed from an older slot in the bundle    //
+//                    (that value does not exist yet).                 //
 //                  - RS dest_tag = dest_valid ? new tag : p0.         //
 //                  - slots younger than a WFI in the bundle are       //
 //                    dropped (never enter the ROB).                   //
 //                  - flush (mispredict at commit): no dispatch; the   //
 //                    freelist rewinds, the RAT loads recover_map, the //
 //                    busy table clears.                               //
-//                 Anything else (illegal, or no unit yet: load/store, //
-//                 FP, CSR, A) gets a ROB entry that is done at        //
+//                 Anything else (illegal, or no unit yet: FP, CSR, A) //
+//                 gets a ROB entry that is done at                    //
 //                 dispatch with an exception and no destination, and  //
 //                 never enters the RS; the ROB raises it at commit.   //
 //                                                                     //
@@ -46,12 +48,16 @@ module dispatch #(
     input        [W-1:0]                  in_valid,
     input  INST  [W-1:0]                  in_inst,
     input        [W-1:0][`XLEN-1:0]       in_pc,
+    input  EXCEPTION [W-1:0]              in_exc,        // fetch exception (PC out of memory range)
     input        [W-1:0][`XLEN-1:0]       in_pred_npc,   // next PC fetch predicted for each slot
     output logic                          fire,          // bundle accepted: fetch may advance
 
     // back-pressure (state-only signals from the ROB and RS)
     input                                 rob_space_ok,
     input                                 rs_space_ok,
+    input                                 lq_space_ok,   // >= W free LQ / SQ entries (state only)
+    input                                 sq_space_ok,
+    input        [W-1:0][`LSQ_IDX_W-1:0]  lsq_idx,       // LQ/SQ entry each load/store slot lands in
     input        [W-1:0][ROB_IDX_W-1:0]   rob_idx,       // ROB entry each slot lands in
 
     // to the ROB
@@ -67,6 +73,8 @@ module dispatch #(
     output logic [W-1:0]                  disp_uncond,     // jal / jalr
     output logic [W-1:0]                  disp_is_call,    // jal/jalr, rd = x1/x5
     output logic [W-1:0]                  disp_is_ret,     // jalr x0, x1/x5
+    output logic [W-1:0]                  disp_is_load,    // allocates an LQ entry (gated by fire)
+    output logic [W-1:0]                  disp_is_store,   // allocates an SQ entry (gated by fire)
     output logic [W-1:0][`XLEN-1:0]       disp_pred_npc,
 
     // to the RS: only slots that have a functional unit to run on
@@ -92,7 +100,7 @@ module dispatch #(
   ALU_FUNC       [W-1:0] alu_func;
   FU_TYPE        [W-1:0] fu_type;
   logic [W-1:0] has_dest, rd_mem, wr_mem, cond_branch, uncond_branch, csr_op, halt, illegal;
-  logic [W-1:0] rs1_fp, rs2_fp, rd_fp, rs3_used, atomic;
+  logic [W-1:0] rs1_fp, rs2_fp, rd_fp, rs3_used, atomic, rs1_used, rs2_used;
 
   logic [W-1:0][4:0] rs1, rs2, rd;
 
@@ -117,7 +125,9 @@ module dispatch #(
         .rs2_fp       (rs2_fp[g]),
         .rd_fp        (rd_fp[g]),
         .rs3_used     (rs3_used[g]),
-        .atomic       (atomic[g])
+        .atomic       (atomic[g]),
+        .rs1_used     (rs1_used[g]),
+        .rs2_used     (rs2_used[g])
     );
     assign rs1[g] = in_inst[g][19:15];
     assign rs2[g] = in_inst[g][24:20];
@@ -141,10 +151,13 @@ module dispatch #(
     for (int i = 0; i < W; i++) begin
       unsupported[i] = !((fu_type[i] == FU_ALU && !cond_branch[i] && !uncond_branch[i]) ||
                          (fu_type[i] == FU_BRANCH && (cond_branch[i] || uncond_branch[i])) ||
-                         fu_type[i] == FU_MULT || fu_type[i] == FU_DIV) ||
-                       rd_mem[i] || wr_mem[i] || csr_op[i] || atomic[i] ||
+                         fu_type[i] == FU_MULT || fu_type[i] == FU_DIV ||
+                         (fu_type[i] == FU_LOAD  && rd_mem[i] && !wr_mem[i]) ||
+                         (fu_type[i] == FU_STORE && wr_mem[i] && !rd_mem[i])) ||
+                       csr_op[i] || atomic[i] ||
                        rs1_fp[i] || rs2_fp[i] || rd_fp[i] || rs3_used[i];
-      exc[i]          = illegal[i] ? EXC_ILLEGAL : unsupported[i] ? EXC_UNSUPPORTED : EXC_NONE;
+      exc[i]          = (in_exc[i] != EXC_NONE) ? in_exc[i] :
+                        illegal[i] ? EXC_ILLEGAL : unsupported[i] ? EXC_UNSUPPORTED : EXC_NONE;
       has_dest_eff[i] = has_dest[i] && (exc[i] == EXC_NONE);
     end
 
@@ -154,7 +167,8 @@ module dispatch #(
   logic [W-1:0][TAG_W-1:0] new_tag, src1_tag, src2_tag, told;
   logic [W-1:0]     src1_bypassed, src2_bypassed, src1_free, src2_free;
 
-  assign fire = (|slot_valid) && can_alloc_w && rob_space_ok && rs_space_ok && !flush;
+  assign fire = (|slot_valid) && can_alloc_w && rob_space_ok && rs_space_ok && lq_space_ok && sq_space_ok
+                && !flush;
 
   always_comb
     for (int i = 0; i < W; i++) dest_valid[i] = slot_valid[i] && has_dest_eff[i] && (rd[i] != '0);
@@ -225,17 +239,20 @@ module dispatch #(
       disp_is_ret[i]     = uncond_branch[i] && in_inst[i][6:0] == `RV32_JALR_OP && rd[i] == 5'd0
                            && (rs1[i] == 5'd1 || rs1[i] == 5'd5);
       disp_pred_npc[i]   = in_pred_npc[i];
+      disp_is_load[i]    = disp_valid[i] && exc[i] == EXC_NONE && fu_type[i] == FU_LOAD;
+      disp_is_store[i]   = disp_valid[i] && exc[i] == EXC_NONE && fu_type[i] == FU_STORE;
 
       disp_pkt[i]            = '0;
       disp_pkt[i].inst       = in_inst[i];
       disp_pkt[i].PC         = in_pc[i];
       disp_pkt[i].NPC        = in_pc[i] + 4;
       disp_pkt[i].src1_tag   = src1_tag[i];
-      disp_pkt[i].src1_ready = src1_free[i] && !src1_bypassed[i];
+      disp_pkt[i].src1_ready = !rs1_used[i] || (src1_free[i] && !src1_bypassed[i]);
       disp_pkt[i].src2_tag   = src2_tag[i];
-      disp_pkt[i].src2_ready = src2_free[i] && !src2_bypassed[i];
+      disp_pkt[i].src2_ready = !rs2_used[i] || (src2_free[i] && !src2_bypassed[i]);
       disp_pkt[i].dest_tag   = dest_valid[i] ? new_tag[i] : '0;
       disp_pkt[i].rob_idx    = rob_idx[i];
+      disp_pkt[i].lsq_idx    = lsq_idx[i];
       disp_pkt[i].fu_type    = fu_type[i];
       disp_pkt[i].alu_func   = alu_func[i];
       disp_pkt[i].opa_select = opa_select[i];

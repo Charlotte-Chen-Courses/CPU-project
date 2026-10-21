@@ -8,7 +8,10 @@
 //                 Added: fu_type (which functional unit; branches and //
 //                 jal/jalr -> FU_BRANCH), register                    //
 //                 class per operand (rs1_fp/rs2_fp/rd_fp), rs3_used   //
-//                 (fused multiply-add), atomic (LR/SC/AMO); and       //
+//                 (fused multiply-add), atomic (LR/SC/AMO),           //
+//                 rs1_used/rs2_used (the field names a source         //
+//                 register, so the RS never waits on immediate        //
+//                 bits); and                                          //
 //                 decode for div/rem, FENCE/FENCE.I (no-ops), the     //
 //                 CSR immediate forms, A, and F. FP ops are only      //
 //                 classified here; the FP unit decodes the exact op   //
@@ -43,7 +46,9 @@ module decoder (
     output logic          rs2_fp,   // 1: rs2 is an f-register
     output logic          rd_fp,    // 1: rd is an f-register
     output logic          rs3_used, // fused multiply-add: third FP source rs3 = inst[31:27]
-    output logic          atomic    // LR/SC/AMO (A extension)
+    output logic          atomic,   // LR/SC/AMO (A extension)
+    output logic          rs1_used, // 1: inst[19:15] names a source register (else an immediate / unused)
+    output logic          rs2_used  // 1: inst[24:20] names a source register
 );
 
     // rounding mode field of FP ops: 101 and 110 are reserved
@@ -71,6 +76,8 @@ module decoder (
         rd_fp         = `FALSE;
         rs3_used      = `FALSE;
         atomic        = `FALSE;
+        rs1_used      = `TRUE;    // cleared below where the field is not a register: a missed case
+        rs2_used      = `TRUE;    // only costs a false dependence, never a wrong result
 
         if (valid) begin
             casez (inst)
@@ -78,16 +85,22 @@ module decoder (
                     has_dest   = `TRUE;
                     opa_select = OPA_IS_ZERO;
                     opb_select = OPB_IS_U_IMM;
+                    rs1_used   = `FALSE;
+                    rs2_used   = `FALSE;
                 end
                 `RV32_AUIPC: begin
                     has_dest   = `TRUE;
                     opa_select = OPA_IS_PC;
                     opb_select = OPB_IS_U_IMM;
+                    rs1_used   = `FALSE;
+                    rs2_used   = `FALSE;
                 end
                 `RV32_JAL: begin
                     has_dest      = `TRUE;
                     opa_select    = OPA_IS_PC;
                     opb_select    = OPB_IS_J_IMM;
+                    rs1_used      = `FALSE;
+                    rs2_used      = `FALSE;
                     uncond_branch = `TRUE;
                     fu_type       = FU_BRANCH;
                 end
@@ -95,6 +108,7 @@ module decoder (
                     has_dest      = `TRUE;
                     opa_select    = OPA_IS_RS1;
                     opb_select    = OPB_IS_I_IMM;
+                    rs2_used      = `FALSE;
                     uncond_branch = `TRUE;
                     fu_type       = FU_BRANCH;
                 end
@@ -109,6 +123,7 @@ module decoder (
                 `RV32_LBU, `RV32_LHU: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     rd_mem     = `TRUE;
                     fu_type    = FU_LOAD;
                 end
@@ -120,45 +135,54 @@ module decoder (
                 `RV32_ADDI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                 end
                 `RV32_SLTI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_SLT;
                 end
                 `RV32_SLTIU: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_SLTU;
                 end
                 `RV32_ANDI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_AND;
                 end
                 `RV32_ORI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_OR;
                 end
                 `RV32_XORI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_XOR;
                 end
                 `RV32_SLLI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_SLL;
                 end
                 `RV32_SRLI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_SRL;
                 end
                 `RV32_SRAI: begin
                     has_dest   = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     alu_func   = ALU_SRA;
                 end
                 `RV32_ADD: begin
@@ -243,13 +267,19 @@ module decoder (
                 end
                 // single core, no self-modifying code: FENCE / FENCE.I act as no-ops
                 `RV32_FENCE_, `RV32_FENCE_I: begin
+                    rs1_used = `FALSE;
+                    rs2_used = `FALSE;
                 end
                 `RV32_CSRRW, `RV32_CSRRS, `RV32_CSRRC,
                 `RV32_CSRRWI, `RV32_CSRRSI, `RV32_CSRRCI: begin
-                    csr_op = `TRUE;
+                    csr_op   = `TRUE;
+                    rs1_used = !inst[14];   // the immediate forms hold a 5-bit uimm there
+                    rs2_used = `FALSE;      // part of the CSR number
                 end
                 `WFI: begin
-                    halt = `TRUE;
+                    halt     = `TRUE;
+                    rs1_used = `FALSE;
+                    rs2_used = `FALSE;
                 end
 
                 // ---- A: atomics (execute through the LSQ) ----
@@ -258,6 +288,7 @@ module decoder (
                     rd_mem     = `TRUE;
                     atomic     = `TRUE;
                     fu_type    = FU_LOAD;
+                    rs2_used   = `FALSE;
                 end
                 `RV32_SC_W: begin
                     has_dest   = `TRUE;       // rd = 0 on success, 1 on failure
@@ -280,6 +311,7 @@ module decoder (
                     has_dest   = `TRUE;
                     rd_fp      = `TRUE;
                     opb_select = OPB_IS_I_IMM;
+                    rs2_used   = `FALSE;
                     rd_mem     = `TRUE;
                     fu_type    = FU_LOAD;
                 end
@@ -301,6 +333,7 @@ module decoder (
                     has_dest = `TRUE;
                     {rs1_fp, rd_fp} = 2'b11;
                     fu_type  = FU_FP;
+                    rs2_used = `FALSE;
                     illegal  = bad_rm;
                 end
                 `RV32_FSGNJ_S, `RV32_FSGNJN_S, `RV32_FSGNJX_S,
@@ -327,11 +360,13 @@ module decoder (
                     has_dest = `TRUE;
                     rs1_fp   = `TRUE;
                     fu_type  = FU_FP;
+                    rs2_used = `FALSE;
                 end
                 `RV32_FCVT_W_S, `RV32_FCVT_WU_S: begin
                     has_dest = `TRUE;
                     rs1_fp   = `TRUE;
                     fu_type  = FU_FP;
+                    rs2_used = `FALSE;
                     illegal  = bad_rm;
                 end
 
@@ -340,11 +375,13 @@ module decoder (
                     has_dest = `TRUE;
                     rd_fp    = `TRUE;
                     fu_type  = FU_FP;
+                    rs2_used = `FALSE;
                 end
                 `RV32_FCVT_S_W, `RV32_FCVT_S_WU: begin
                     has_dest = `TRUE;
                     rd_fp    = `TRUE;
                     fu_type  = FU_FP;
+                    rs2_used = `FALSE;
                     illegal  = bad_rm;
                 end
 

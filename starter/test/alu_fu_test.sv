@@ -151,7 +151,7 @@ module testbench;
             m_valid = in_valid;
             if (in_valid)
                 m_pkt = '{tag: in_pkt.dest_tag, value: model(in_pkt, rs1_value, rs2_value),
-                          rob_idx: in_pkt.rob_idx, branch: 0, next_pc: '0, misaligned: 0};
+                          rob_idx: in_pkt.rob_idx, branch: 0, next_pc: '0, exception: EXC_NONE};
         end
         @(negedge clock);
     endtask

@@ -86,7 +86,10 @@ module icache (
     logic [3:0] current_mem_tag; // The current memory tag we might be waiting on
     logic miss_outstanding; // Whether a miss has received its response tag to wait on
 
-    wire got_mem_data = (current_mem_tag == Imem2proc_tag) && (current_mem_tag != 0);
+    // Fixed for the OoO core: data that arrives in the cycle the address changes belongs to the
+    // old address; without !changed_addr it was written under the NEW address's tag (fetch
+    // redirect during a miss would then fetch wrong instructions).
+    wire got_mem_data = (current_mem_tag == Imem2proc_tag) && (current_mem_tag != 0) && !changed_addr;
 
     wire changed_addr = (current_index != last_index) || (current_tag != last_tag);
 

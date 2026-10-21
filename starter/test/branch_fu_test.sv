@@ -77,7 +77,7 @@ module testbench;
             end
         endcase
         r = '{tag: p.dest_tag, value: link, rob_idx: p.rob_idx, branch: 1, next_pc: t ? tgt : link,
-              misaligned: t && (tgt[1:0] != 2'b00)};
+              exception: (t && (tgt[1:0] != 2'b00)) ? EXC_MISALIGNED : EXC_NONE};
         return r;
     endfunction
 
@@ -135,7 +135,7 @@ module testbench;
             if (in_valid) begin
                 m_pkt = model(in_pkt, rs1_value, rs2_value);
                 if (m_pkt.next_pc != m_pkt.value) n_taken++;
-                if (m_pkt.misaligned) n_misaligned++;
+                if (m_pkt.exception == EXC_MISALIGNED) n_misaligned++;
             end
         end
         @(negedge clock);

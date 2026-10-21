@@ -5,15 +5,24 @@
 //  Description :  Top level of the R10K-style core: integer ALU code, //
 //                 branches and jumps, ending in WFI.                  //
 //                                                                     //
-//    fetch (W words at PC) -> dispatch (decode, rename) -> ROB + RS   //
+//    fetch (I-cache) -> dispatch (decode, rename) -> ROB + RS         //
 //    RS select -> PRF read -> ALU FU -> CDB arbiter -> CDB            //
 //    CDB -> PRF write, RS wakeup, busy table, ROB done                //
 //    ROB commit -> freelist free, retirement RAT, halt                //
 //    ROB commit of a mispredict -> flush (recovery at commit)         //
 //                                                                     //
-//                 Fetch: the testbench returns W words at imem_addr   //
-//                 (combinational). PC advances by 4*W when dispatch   //
-//                 fires; fetching stops after a WFI is dispatched.    //
+//                 Fetch: P3's I-cache (8-byte blocks, blocking), both //
+//                 caches on mem.sv through mem_arbiter. 2 slots per   //
+//                 cycle when pc[2] == 0, else 1; PC advances by the   //
+//                 slots fetched when dispatch fires; fetching stops   //
+//                 after a WFI is dispatched.                          //
+//                 Loads/stores: LSQ (lsq.sv) on the FU_LOAD/FU_STORE  //
+//                 ports -> D-cache -> mem_arbiter. Stores write the   //
+//                 D-cache after commit; stores_pending tells the      //
+//                 testbench when they have all gone. A load that ran  //
+//                 ahead of an overlapping older store is replayed     //
+//                 (ROB flush at its own PC); with LSQ_SPECULATE = 2   //
+//                 the load-wait table makes it wait next time.        //
 //                 Issue: the PRF is read in the same cycle the RS     //
 //                 selects (RS ready bits are flops, so a selected     //
 //                 instruction's sources are already in the PRF), and  //
@@ -39,7 +48,7 @@
 //                 path they are squashed like everything else.        //
 //                 M extension: pipelined multiplier (mult_fu) and     //
 //                 iterative divider (div_fu), each its own port.      //
-//                 Not yet: LSQ, FP, checkpoints.                      //
+//                 Not yet: FP, A, checkpoints.                        //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -56,9 +65,13 @@ module cpu #(
     input                               clock,
     input                               reset,
 
-    // instruction memory: W consecutive words starting at imem_addr
-    output logic [`XLEN-1:0]            imem_addr,
-    input  INST  [W-1:0]                imem_data,
+    // memory (P3 mem.sv protocol, shared by the I-cache and D-cache through mem_arbiter)
+    output logic [1:0]                  proc2mem_command,
+    output logic [`XLEN-1:0]            proc2mem_addr,
+    output logic [63:0]                 proc2mem_data,
+    input        [3:0]                  mem2proc_response,
+    input        [63:0]                 mem2proc_data,
+    input        [3:0]                  mem2proc_tag,
 
     // commit trace for the testbench
     output logic [W-1:0]                commit_valid,
@@ -68,7 +81,8 @@ module cpu #(
     output logic [W-1:0][`XLEN-1:0]     commit_pc,
     output logic                        halted,         // a WFI or an exception has committed
     output EXCEPTION                    exception,      // why it stopped (EXC_NONE = WFI)
-    output logic [`XLEN-1:0]            exception_pc    // PC of the excepting instruction
+    output logic [`XLEN-1:0]            exception_pc,   // PC of the excepting instruction
+    output logic                        stores_pending  // committed stores not yet in the D-cache
 );
 
   // ---------------- fetch ----------------
@@ -87,19 +101,55 @@ module cpu #(
   logic [W-1:0][`XLEN-1:0] pred_target;
   logic [`XLEN-1:0]        fetch_next_pc;  // where fetch goes after this bundle
 
-  assign imem_addr = pc;
+  // ---- I-cache: one 8-byte block = 2 instructions per cycle ----
+  // A 2-wide bundle only fits when pc[2] == 0; otherwise the block holds just slot 0 and
+  // fetch continues at pc + 4. A PC outside memory is never sent to the I-cache (mem.sv
+  // would never answer); slot 0 gets EXC_ACCESS instead, raised only if it commits.
+  logic             pc_in_range, icache_valid;
+  logic [63:0]      icache_block;
+  INST  [W-1:0]     fetch_inst;
+  EXCEPTION [W-1:0] fetch_exc;
+  logic [1:0]       i_command, d_command;
+  logic [`XLEN-1:0] i_addr, d_addr;
+  logic [63:0]      d_data, mem_rdata;
+  logic [3:0]       i_response, i_tag, d_response, d_tag;
+
+  assign pc_in_range = (pc < `MEM_SIZE_IN_BYTES);
+
+  icache icache_0 (
+      .clock             (clock),
+      .reset             (reset),
+      .Imem2proc_response(i_response),
+      .Imem2proc_data    (mem_rdata),
+      .Imem2proc_tag     (i_tag),
+      .proc2Icache_addr  (pc_in_range ? pc : '0),
+      .proc2Imem_command (i_command),
+      .proc2Imem_addr    (i_addr),
+      .Icache_data_out   (icache_block),
+      .Icache_valid_out  (icache_valid)
+  );
+
   // the first slot predicted taken redirects fetch; younger slots in the bundle are dropped
   // a predicted return takes its target from the RAS; a predicted call pushes its PC+4.
   // Both are taken jumps, so they end the bundle: at most one RAS op per cycle.
   always_comb begin
     automatic bit redirected = `FALSE;
-    fetch_next_pc = pc + `XLEN'(4 * W);
+    automatic int n_avail = pc_in_range ? (pc[2] ? 1 : 2) : 1;   // slots this block can give
+    if (n_avail > W) n_avail = W;
+    fetch_next_pc = pc + `XLEN'(4 * n_avail);
     ras_push      = `FALSE;
     ras_pop       = `FALSE;
     ras_push_addr = '0;
     for (int i = 0; i < W; i++) begin
       fetch_pc[i]       = pc + `XLEN'(4 * i);
-      fetch_valid[i]    = !fetch_stop && !redirected;
+      fetch_inst[i]     = (int'(pc[2]) + i < 2) ? (pc[2] + i == 1 ? icache_block[63:32] : icache_block[31:0])
+                                                : `NOP;
+      fetch_exc[i]      = EXC_NONE;
+      if (!pc_in_range) begin
+        fetch_inst[i] = `NOP;
+        fetch_exc[i]  = EXC_ACCESS;
+      end
+      fetch_valid[i]    = !fetch_stop && !redirected && i < n_avail && (icache_valid || !pc_in_range);
       fetch_pred_npc[i] = !pred_taken[i] ? fetch_pc[i] + 4 :
                            pred_ret[i]   ? ras_top        : pred_target[i];
       if (fetch_valid[i] && pred_taken[i]) begin
@@ -154,6 +204,7 @@ module cpu #(
   logic [W-1:0][ROB_IDX_W-1:0] rob_disp_idx;
   logic [W-1:0]                disp_valid, disp_dest_valid, disp_halt, rs_disp_valid;
   logic [W-1:0]                disp_is_br, disp_uncond, disp_is_call, disp_is_ret;
+  logic [W-1:0]                disp_is_load, disp_is_store, commit_is_load, commit_is_store;
   EXCEPTION [W-1:0]            disp_exception, commit_exception;
   logic [W-1:0][4:0]           disp_rd;
   logic [W-1:0][TAG_W-1:0]     disp_tag, disp_told;
@@ -165,7 +216,8 @@ module cpu #(
   logic [CDB_SZ-1:0][TAG_W-1:0]     cdb_tag;
   logic [CDB_SZ-1:0][ROB_IDX_W-1:0] cdb_rob_idx;
   logic [CDB_SZ-1:0][`XLEN-1:0]     cdb_value, cdb_next_pc;
-  logic [CDB_SZ-1:0]                cdb_branch, cdb_misaligned;
+  logic [CDB_SZ-1:0]                cdb_branch;
+  EXCEPTION [CDB_SZ-1:0]            cdb_exception;
   logic [`ARCH_REG_SZ-1:0][TAG_W-1:0] retire_map, retire_map_next;
 
   logic [W-1:0]                commit_halt;
@@ -178,19 +230,23 @@ module cpu #(
       cdb_value[k]   = cdb_pkt[k].value;
       cdb_branch[k]  = cdb_pkt[k].branch;
       cdb_next_pc[k] = cdb_pkt[k].next_pc;
-      cdb_misaligned[k] = cdb_pkt[k].misaligned;
+      cdb_exception[k] = cdb_pkt[k].exception;
     end
 
   dispatch dispatch_0 (
       .clock          (clock),
       .reset          (reset),
       .in_valid       (fetch_valid),
-      .in_inst        (imem_data),
+      .in_inst        (fetch_inst),
       .in_pc          (fetch_pc),
+      .in_exc         (fetch_exc),
       .in_pred_npc    (fetch_pred_npc),
       .fire           (fire),
       .rob_space_ok   (rob_space_ok),
       .rs_space_ok    (rs_space_ok),
+      .lq_space_ok    (lq_space_ok),
+      .sq_space_ok    (sq_space_ok),
+      .lsq_idx        (disp_lsq_idx),
       .rob_idx        (rob_disp_idx),
       .disp_valid     (disp_valid),
       .disp_dest_valid(disp_dest_valid),
@@ -205,6 +261,8 @@ module cpu #(
       .disp_uncond    (disp_uncond),
       .disp_is_call   (disp_is_call),
       .disp_is_ret    (disp_is_ret),
+      .disp_is_load   (disp_is_load),
+      .disp_is_store  (disp_is_store),
       .rs_disp_valid  (rs_disp_valid),
       .disp_pkt       (disp_pkt),
       .cdb_valid      (cdb_valid),
@@ -229,6 +287,8 @@ module cpu #(
   end
 
   // ---------------- ROB ----------------
+  logic                  viol_valid, replay_flush;   // LSQ memory-order violation -> replay at commit
+  logic [`ROB_IDX_W-1:0] viol_rob_idx;
   rob rob_0 (
       .clock            (clock),
       .reset            (reset),
@@ -245,13 +305,17 @@ module cpu #(
       .disp_uncond      (disp_uncond),
       .disp_is_call     (disp_is_call),
       .disp_is_ret      (disp_is_ret),
+      .disp_is_load     (disp_is_load),
+      .disp_is_store    (disp_is_store),
+      .replay_valid     (viol_valid),
+      .replay_rob_idx   (viol_rob_idx),
       .disp_idx         (rob_disp_idx),
       .space_ok         (rob_space_ok),
       .cdb_valid        (cdb_valid),
       .cdb_rob_idx      (cdb_rob_idx),
       .cdb_branch       (cdb_branch),
       .cdb_next_pc      (cdb_next_pc),
-      .cdb_misaligned   (cdb_misaligned),
+      .cdb_exception    (cdb_exception),
       .commit_stop      (halted),         // younger entries behind an exception never commit
       .commit_valid     (commit_valid),
       .commit_dest_valid(commit_dest_valid),
@@ -263,11 +327,14 @@ module cpu #(
       .commit_uncond    (commit_uncond),
       .commit_is_call   (commit_is_call),
       .commit_is_ret    (commit_is_ret),
+      .commit_is_load   (commit_is_load),
+      .commit_is_store  (commit_is_store),
       .commit_next_pc   (commit_next_pc),
       .commit_halt      (commit_halt),
       .commit_exception (commit_exception),
       .flush            (flush),
-      .redirect_pc      (redirect_pc)
+      .redirect_pc      (redirect_pc),
+      .replay_flush     (replay_flush)
   );
 
 
@@ -413,6 +480,8 @@ module cpu #(
           .rs1_value(rs1_value[g]),
           .rs2_value(rs2_value[g])
       );
+    end else if (g == LD_PORT || g == ST_PORT) begin : gen_lsq
+      // load / store ports belong to the LSQ (connected below)
     end else begin : gen_none
       // FU type not implemented yet: never ready, never produces a result
       assign fu_ready[g]     = `FALSE;
@@ -420,6 +489,112 @@ module cpu #(
       assign fu_out_pkt[g]   = '0;
     end
   end
+
+  // ---------------- load/store queue ----------------
+  localparam LD_PORT = `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV;   // port_type() order
+  localparam ST_PORT = LD_PORT + `NUM_FU_LOAD;
+  logic                         lq_space_ok, sq_space_ok;
+  logic [W-1:0][`LSQ_IDX_W-1:0] disp_lsq_idx;
+  logic                         dc_req_valid, dc_req_ready, dc_req_store, dc_resp_valid;
+  logic [`XLEN-1:0]             dc_req_addr, dc_req_data, dc_resp_data;
+  MEM_SIZE                      dc_req_size;
+  logic [`DMEM_ID_W-1:0]        dc_req_id, dc_resp_id;
+
+  // memory-dependence prediction: a load replayed once waits for older store addresses next time
+  logic lwt_wait;
+  load_wait_table lwt_0 (
+      .clock      (clock),
+      .reset      (reset),
+      .lookup_pc  (issue_pkt[LD_PORT].PC),
+      .lookup_wait(lwt_wait),
+      .train_valid(replay_flush),
+      .train_pc   (redirect_pc)     // a replay re-fetches the load's own PC
+  );
+
+  lsq lsq_0 (
+      .clock         (clock),
+      .reset         (reset),
+      .flush         (flush),
+      .disp_load     (disp_is_load),
+      .disp_store    (disp_is_store),
+      .disp_lsq_idx  (disp_lsq_idx),
+      .lq_space_ok   (lq_space_ok),
+      .sq_space_ok   (sq_space_ok),
+      .ld_in_valid   (issue_valid[LD_PORT]),
+      .ld_in_pkt     (issue_pkt[LD_PORT]),
+      .ld_rs1        (rs1_value[LD_PORT]),
+      .ld_wait       (`LSQ_SPECULATE == 2 && lwt_wait),
+      .ld_ready      (fu_ready[LD_PORT]),
+      .ld_out_valid  (fu_out_valid[LD_PORT]),
+      .ld_out_pkt    (fu_out_pkt[LD_PORT]),
+      .ld_out_grant  (fu_grant[LD_PORT]),
+      .st_in_valid   (issue_valid[ST_PORT]),
+      .st_in_pkt     (issue_pkt[ST_PORT]),
+      .st_rs1        (rs1_value[ST_PORT]),
+      .st_rs2        (rs2_value[ST_PORT]),
+      .st_ready      (fu_ready[ST_PORT]),
+      .st_out_valid  (fu_out_valid[ST_PORT]),
+      .st_out_pkt    (fu_out_pkt[ST_PORT]),
+      .st_out_grant  (fu_grant[ST_PORT]),
+      .commit_load   (commit_is_load),
+      .commit_store  (commit_is_store),
+      .dmem_req_valid(dc_req_valid),
+      .dmem_req_ready(dc_req_ready),
+      .dmem_req_store(dc_req_store),
+      .dmem_req_addr (dc_req_addr),
+      .dmem_req_size (dc_req_size),
+      .dmem_req_data (dc_req_data),
+      .dmem_req_id   (dc_req_id),
+      .dmem_resp_valid(dc_resp_valid),
+      .dmem_resp_id  (dc_resp_id),
+      .dmem_resp_data(dc_resp_data),
+      .stores_pending(stores_pending),
+      .viol_valid    (viol_valid),
+      .viol_rob_idx  (viol_rob_idx)
+  );
+
+  // ---------------- memory hierarchy ----------------
+  dcache dcache_0 (
+      .clock       (clock),
+      .reset       (reset),
+      .req_valid   (dc_req_valid),
+      .req_ready   (dc_req_ready),
+      .req_store   (dc_req_store),
+      .req_addr    (dc_req_addr),
+      .req_size    (dc_req_size),
+      .req_data    (dc_req_data),
+      .req_id      (dc_req_id),
+      .resp_valid  (dc_resp_valid),
+      .resp_id     (dc_resp_id),
+      .resp_data   (dc_resp_data),
+      .mem_command (d_command),
+      .mem_addr    (d_addr),
+      .mem_data    (d_data),
+      .mem_response(d_response),
+      .mem_rdata   (mem_rdata),
+      .mem_tag     (d_tag)
+  );
+
+  mem_arbiter mem_arbiter_0 (
+      .clock       (clock),
+      .reset       (reset),
+      .d_command   (d_command),
+      .d_addr      (d_addr),
+      .d_data      (d_data),
+      .d_response  (d_response),
+      .d_tag       (d_tag),
+      .i_command   (i_command),
+      .i_addr      (i_addr),
+      .i_response  (i_response),
+      .i_tag       (i_tag),
+      .rdata       (mem_rdata),
+      .mem_command (proc2mem_command),
+      .mem_addr    (proc2mem_addr),
+      .mem_data    (proc2mem_data),
+      .mem_response(mem2proc_response),
+      .mem_rdata   (mem2proc_data),
+      .mem_tag     (mem2proc_tag)
+  );
 
   cdb_arbiter cdb_arbiter_0 (
       .fu_valid (fu_out_valid),

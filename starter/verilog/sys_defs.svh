@@ -43,17 +43,35 @@
 `define BTB_SZ 32
 `define BHT_SZ 256
 `define RAS_SZ 8      // return address stack depth (power of 2)
-`define LSQ_SZ xx
+// load / store queues (powers of 2)
+`define LQ_SZ 8
+`define SQ_SZ 8
+`define LSQ_IDX_W ($clog2(`LQ_SZ) > $clog2(`SQ_SZ) ? $clog2(`LQ_SZ) : $clog2(`SQ_SZ))
+`define DMEM_ID_W 8      // data-memory request id (a load's sequence number)
+// 0: conservative (a load waits for every older store address)
+// 1: speculate: a load may go to memory before older store addresses are known (a store that
+//    later turns out to overlap replays it)
+// 2: speculate, except loads the load-wait table predicts will violate (they wait, as in 0)
+`define LSQ_SPECULATE 2
+// load-wait table (LSQ_SPECULATE = 2): one bit per entry, indexed by load PC, set when that load
+// is replayed; all bits clear every LWT_CLEAR cycles so stale predictions expire (Alpha 21264)
+`define LWT_SZ    64     // power of 2
+`define LWT_CLEAR 16384
+// data cache (sizes in bytes; powers of 2). Blocks match mem.sv's 64-bit bus.
+`define DC_SZ   256
+`define DC_WAYS 2
+`define DC_BLK  8
 
 // functional units (you should decide if you want more or fewer types of FUs)
 
 // Exception causes, raised only when the instruction reaches commit (a wrong-path one is
 // squashed by the older mispredict's flush and never reported)
-typedef enum logic [1:0] {
-  EXC_NONE        = 2'h0,
-  EXC_ILLEGAL     = 2'h1,   // decoder: not an RV32IMAF instruction
-  EXC_UNSUPPORTED = 2'h2,   // legal, but this core has no unit for it yet (load/store/mult/FP/CSR/A)
-  EXC_MISALIGNED  = 2'h3    // taken branch / jump target not 4-byte aligned
+typedef enum logic [2:0] {
+  EXC_NONE        = 3'h0,
+  EXC_ILLEGAL     = 3'h1,   // decoder: not an RV32IMAF instruction
+  EXC_UNSUPPORTED = 3'h2,   // legal, but this core has no unit for it yet (FP/CSR/A)
+  EXC_MISALIGNED  = 3'h3,   // taken branch/jump target, or load/store address, not naturally aligned
+  EXC_ACCESS      = 3'h4    // load/store address outside data memory (MEM_SIZE_IN_BYTES)
 } EXCEPTION;
 
 typedef enum logic [2:0] {
@@ -66,12 +84,12 @@ typedef enum logic [2:0] {
   FU_DIV      // div, divu, rem, remu: iterative divider
 } FU_TYPE;
 
-`define NUM_FU_ALU 1
+`define NUM_FU_ALU 2
 `define NUM_FU_BRANCH 1
 `define NUM_FU_MULT 1
 `define NUM_FU_DIV 1
-`define NUM_FU_LOAD 0
-`define NUM_FU_STORE 0
+`define NUM_FU_LOAD 1    // the LSQ has exactly one load port and one store port
+`define NUM_FU_STORE 1
 `define NUM_FU_FP 0
 `define NUM_FU (`NUM_FU_ALU+`NUM_FU_BRANCH+`NUM_FU_MULT+`NUM_FU_DIV+`NUM_FU_LOAD+`NUM_FU_STORE+`NUM_FU_FP)
 
@@ -439,6 +457,9 @@ typedef struct packed {
   logic              uncond;      // jal / jalr
   logic              is_call;     // jal/jalr with rd = x1/x5 (RAS push)
   logic              is_ret;      // jalr x0, x1/x5 (RAS pop)
+  logic              is_load;     // commit frees its LQ entry
+  logic              is_store;    // commit lets its SQ entry drain to memory
+  logic              replay;      // load that read memory too early: re-fetch it at commit
 } ROB_PACKET;
 
 
@@ -463,7 +484,7 @@ typedef struct packed {
   ALU_FUNC alu_func;  // ALU function select (ALU_xxx *)
   ALU_OPA_SELECT opa_select;  // ALU opa mux select (ALU_OPA_xxx *)
   ALU_OPB_SELECT opb_select;  // ALU opb mux select (ALU_OPB_xxx *)
-  // TODO: other fields
+  logic [`LSQ_IDX_W-1:0] lsq_idx;  // loads: LQ entry; stores: SQ entry
 
 } RS_PACKET;
 
@@ -478,7 +499,8 @@ typedef struct packed {
   logic [`ROB_IDX_W-1:0] rob_idx;
   logic                  branch;   // result of a branch/jump: next_pc is valid
   logic [`XLEN-1:0]      next_pc;  // actual next PC (branches only)
-  logic                  misaligned; // branch/jump: taken target not 4-byte aligned
+  EXCEPTION              exception;  // raised by this instruction (misaligned target/address,
+                                     // address out of range); the ROB records it
 } CDB_PACKET;
 
 

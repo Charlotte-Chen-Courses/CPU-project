@@ -9,8 +9,10 @@
 //                 rounding mode) and checks the classification:       //
 //                 fu_type, has_dest, rd_mem/wr_mem, branch flags,     //
 //                 register classes (rs1_fp/rs2_fp/rd_fp), rs3_used,   //
-//                 atomic, csr_op, halt, illegal. Also checks reserved //
-//                 rounding modes are illegal, valid=0 gives a NOP,    //
+//                 atomic, csr_op, halt, illegal, and rs1_used/        //
+//                 rs2_used against an opcode table. Also checks       //
+//                 reserved rounding modes are illegal, valid=0 gives  //
+//                 a NOP,                                              //
 //                 and unknown opcodes are illegal.                    //
 //                 Prints @@@ Passed/Failed.                           //
 //                                                                     //
@@ -28,7 +30,7 @@ module testbench;
     ALU_FUNC       alu_func;
     logic          rd_mem, wr_mem, cond_branch, uncond_branch, csr_op, halt, illegal;
     FU_TYPE        fu_type;
-    logic          rs1_fp, rs2_fp, rd_fp, rs3_used, atomic;
+    logic          rs1_fp, rs2_fp, rd_fp, rs3_used, atomic, rs1_used, rs2_used;
 
     decoder dut (
         .inst(inst), .valid(valid),
@@ -36,7 +38,7 @@ module testbench;
         .rd_mem(rd_mem), .wr_mem(wr_mem), .cond_branch(cond_branch), .uncond_branch(uncond_branch),
         .csr_op(csr_op), .halt(halt), .illegal(illegal),
         .fu_type(fu_type), .rs1_fp(rs1_fp), .rs2_fp(rs2_fp), .rd_fp(rd_fp),
-        .rs3_used(rs3_used), .atomic(atomic)
+        .rs3_used(rs3_used), .atomic(atomic), .rs1_used(rs1_used), .rs2_used(rs2_used)
     );
 
     int errors = 0, n_checks = 0;
@@ -77,10 +79,36 @@ module testbench;
         return e;
     endfunction
 
+    // which register fields a legal instruction reads, by opcode (written independently of the
+    // decoder's per-instruction cases)
+    function automatic logic [1:0] ref_used(input logic [31:0] w);
+        case (w[6:0])
+            7'b0110111, 7'b0010111, 7'b1101111: return 2'b00;          // lui, auipc, jal
+            7'b0001111:                         return 2'b00;          // fence
+            7'b1100111, 7'b0000011, 7'b0000111,
+            7'b0010011:                         return 2'b10;          // jalr, loads, flw, op-imm
+            7'b1100011, 7'b0100011, 7'b0100111,
+            7'b0110011:                         return 2'b11;          // branches, stores, fsw, op (incl. M)
+            7'b1110011:                         return (w[13:12] == 2'b00 || w[14]) ? 2'b00 : 2'b10;  // wfi / csr
+            7'b0101111:                         return (w[31:27] == 5'b00010) ? 2'b10 : 2'b11;        // lr / sc, amo
+            7'b1000011, 7'b1000111, 7'b1001011,
+            7'b1001111:                         return 2'b11;          // fused multiply-add
+            7'b1010011: case (w[31:27])
+                            5'b01011, 5'b11000, 5'b11010, 5'b11100, 5'b11110: return 2'b10;  // fsqrt, fcvt, fmv, fclass
+                            default:                                          return 2'b11;
+                        endcase
+            default:                            return 2'b11;
+        endcase
+    endfunction
+
     task automatic check(input string name, input logic [31:0] w, input exp_t e);
         inst = w; valid = 1;
         #1;
         n_checks++;
+        if (!e.ill && {rs1_used, rs2_used} !== ref_used(w)) begin
+            errors++;
+            $display("  FAIL: %s (%h): rs1_used/rs2_used = %b%b, expected %b", name, w, rs1_used, rs2_used, ref_used(w));
+        end
         if (fu_type !== e.fu || has_dest !== e.hd || rd_mem !== e.rm || wr_mem !== e.wm ||
             cond_branch !== e.cb || uncond_branch !== e.ub || rs1_fp !== e.r1f || rs2_fp !== e.r2f ||
             rd_fp !== e.rdf || rs3_used !== e.r3 || atomic !== e.at || csr_op !== e.csr ||
@@ -112,6 +140,14 @@ module testbench;
         for (int rep = 0; rep < 20; rep++) begin
             // ---- unchanged base cases, now with fu_type ----
             check("addi",  I(3'b000, 7'b0010011), E(FU_ALU, 1));
+            for (int f3 = 2; f3 < 8; f3++)                              // slti .. andi (shifts below)
+                if (f3 != 5) check($sformatf("op-imm f3=%0d", f3), I(3'(f3), 7'b0010011), E(FU_ALU, 1));
+            check("slli",  R(7'b0000000, 3'b001, 7'b0010011), E(FU_ALU, 1));
+            check("srai",  R(7'b0100000, 3'b101, 7'b0010011), E(FU_ALU, 1));
+            check("lui",   {20'($urandom), 5'($urandom), 7'b0110111}, E(FU_ALU, 1));
+            check("auipc", {20'($urandom), 5'($urandom), 7'b0010111}, E(FU_ALU, 1));
+            check("lbu",   I(3'b100, 7'b0000011), E(FU_LOAD, 1, .rm(1)));
+            check("sb",    S(3'b000, 7'b0100011), E(FU_STORE, 0, .wm(1)));
             check("add",   R(7'b0000000, 3'b000, 7'b0110011), E(FU_ALU, 1));
             check("lw",    I(3'b010, 7'b0000011), E(FU_LOAD, 1, .rm(1)));
             check("sw",    S(3'b010, 7'b0100011), E(FU_STORE, 0, .wm(1)));

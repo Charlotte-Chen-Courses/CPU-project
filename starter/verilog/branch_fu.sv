@@ -10,7 +10,7 @@
 //                 jalr = (rs1 + imm) with bit 0 cleared. The result   //
 //                 goes on the CDB with branch = 1; the ROB compares   //
 //                 next_pc with the predicted next PC at commit. A     //
-//                 misaligned taken target sets misaligned (the ROB    //
+//                 misaligned taken target sets EXC_MISALIGNED (the ROB//
 //                 raises the exception only if it commits). Same      //
 //                 interface as alu_fu: one-entry result register held //
 //                 until out_grant; flush drops it.                    //
@@ -79,7 +79,7 @@ module branch_fu (
       if (in_valid)
         out_pkt <= '{tag: in_pkt.dest_tag, value: link, rob_idx: in_pkt.rob_idx,
                      branch: `TRUE, next_pc: next_pc,
-                     misaligned: (next_pc[1:0] != 2'b00)};   // no C extension: would trap
+                     exception: (next_pc[1:0] != 2'b00) ? EXC_MISALIGNED : EXC_NONE};   // no C extension
     end
     // else: holding a result that lost arbitration — keep it
   end

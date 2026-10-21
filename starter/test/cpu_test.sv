@@ -24,6 +24,10 @@
 //                 their bodies never write. Directed recovery cases,  //
 //                 then random programs. Reports IPC, branches,        //
 //                 mispredicts and dispatch stalls.                    //
+//                 +program=<file>: instead, run one program image     //
+//                 (one hex byte per line from address 0, e.g. built   //
+//                 from programs/*.s/*.c) with the same ISS checks;    //
+//                 +trace=<file> also writes the commit trace.         //
 //                 Prints @@@ Passed/Failed.                           //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
@@ -39,12 +43,14 @@ module testbench;
 
     localparam W     = `SUPERSCALAR_WIDTH;
     localparam TAG_W = `TAG_W;
-    localparam MAXN  = 8192;
+    localparam MAXN  = `MEM_SIZE_IN_BYTES / 4;   // a loaded image can fill memory
     localparam logic [31:0] WFI = 32'h10500073;
 
     logic                        clock, reset;
-    logic [`XLEN-1:0]            imem_addr;
-    INST  [W-1:0]                imem_data;
+    logic [1:0]                  proc2mem_command;
+    logic [`XLEN-1:0]            proc2mem_addr;
+    logic [63:0]                 proc2mem_data, mem2proc_data;
+    logic [3:0]                  mem2proc_response, mem2proc_tag;
     logic [W-1:0]                commit_valid, commit_dest_valid;
     logic [W-1:0][4:0]           commit_rd;
     logic [W-1:0][TAG_W-1:0]     commit_tag;
@@ -52,12 +58,17 @@ module testbench;
     logic                        halted;
     EXCEPTION                    exception;
     logic [`XLEN-1:0]            exception_pc;
+    logic                        stores_pending;
 
     cpu dut (
         .clock            (clock),
         .reset            (reset),
-        .imem_addr        (imem_addr),
-        .imem_data        (imem_data),
+        .proc2mem_command (proc2mem_command),
+        .proc2mem_addr    (proc2mem_addr),
+        .proc2mem_data    (proc2mem_data),
+        .mem2proc_response(mem2proc_response),
+        .mem2proc_data    (mem2proc_data),
+        .mem2proc_tag     (mem2proc_tag),
         .commit_valid     (commit_valid),
         .commit_dest_valid(commit_dest_valid),
         .commit_rd        (commit_rd),
@@ -65,20 +76,31 @@ module testbench;
         .commit_pc        (commit_pc),
         .halted           (halted),
         .exception        (exception),
-        .exception_pc     (exception_pc)
+        .exception_pc     (exception_pc),
+        .stores_pending   (stores_pending)
     );
 
     always #5 clock = ~clock;
 
-    // ---- instruction memory (past the program: WFI, never X) ----
+    // ---- P3 memory (the core fetches through its I-cache) ----
+    mem memory (
+        .clk              (clock),
+        .proc2mem_addr    (proc2mem_addr),
+        .proc2mem_data    (proc2mem_data),
+        .proc2mem_command (proc2mem_command),
+        .mem2proc_response(mem2proc_response),
+        .mem2proc_data    (mem2proc_data),
+        .mem2proc_tag     (mem2proc_tag)
+    );
+
+    // the program, as words (the ISS reads this; run_program copies it into mem.sv)
     logic [31:0] imem [MAXN];
     int          prog_len;
 
-    always_comb
-        for (int i = 0; i < W; i++) begin
-            automatic int a = int'(imem_addr >> 2) + i;
-            imem_data[i] = (a >= 0 && a < prog_len) ? imem[a] : WFI;
-        end
+    // memory past the program reads as 0 (an illegal instruction)
+    function automatic logic [31:0] prog_word(input int idx);
+        return (idx >= 0 && idx < prog_len) ? imem[idx] : 32'h0;
+    endfunction
 
     // ---- encoders ----
     function automatic logic [31:0] enc_r(input logic [6:0] f7, input logic [2:0] f3,
@@ -110,16 +132,39 @@ module testbench;
     endfunction
 
     // random ALU instruction: sources from 0..nsrc-1, destination from dlo..dhi
+    function automatic logic [31:0] enc_load(input logic [2:0] f3, input int rd, input int rs1, input logic [11:0] imm);
+        return {imm, 5'(rs1), f3, 5'(rd), 7'b0000011};
+    endfunction
+    function automatic logic [31:0] enc_store(input logic [2:0] f3, input int rs2, input int rs1, input logic [11:0] imm);
+        return {imm[11:5], 5'(rs2), 5'(rs1), f3, imm[4:0], 7'b0100011};
+    endfunction
+
+    localparam int DBASE = 'h8000;          // data region (x28 points here); code lives below
+    localparam int DREG  = 28;              // base register: never written by generated code
+
+    // a load or store into the 64-byte data window, naturally aligned
+    function automatic logic [31:0] rand_mem(input int nsrc, input int dlo, input int dhi);
+        int f      = $urandom_range(0, 7);
+        int store  = $urandom_range(0, 1);
+        int sz     = f % 3;                                   // 0 byte, 1 half, 2 word
+        int off    = $urandom_range(0, 63) & ~((1 << sz) - 1);
+        int rd     = $urandom_range(dlo, dhi);
+        int rs2    = $urandom_range(0, nsrc - 1);
+        logic [2:0] f3 = (!store && sz < 2 && f >= 3) ? 3'(4 + sz) : 3'(sz);   // lbu / lhu sometimes
+        return store ? enc_store(3'(sz), rs2, DREG, 12'(off)) : enc_load(f3, rd, DREG, 12'(off));
+    endfunction
+
     function automatic logic [31:0] rand_alu(input int nsrc, input int dlo = 0, input int dhi = 7);
         int rd  = $urandom_range(dlo, dhi);
         int rs1 = $urandom_range(0, nsrc - 1);
         int rs2 = $urandom_range(0, nsrc - 1);
-        int op  = $urandom_range(0, 21);
+        int op  = $urandom_range(0, 27);
         int sk  = $urandom_range(0, 2);
         int mf  = $urandom_range(0, 7);
         case (op)
             18, 19, 20: return enc_r(7'b0000001, 3'(mf % 4), rd, rs1, rs2);        // mul, mulh, mulhsu, mulhu
             21:         return enc_r(7'b0000001, 3'(4 + mf % 4), rd, rs1, rs2);    // div, divu, rem, remu
+            22, 23, 24, 25, 26, 27: return rand_mem(nsrc, dlo, dhi);                // load / store
             0:  return enc_r(7'b0000000, 3'b000, rd, rs1, rs2);   // add
             1:  return enc_r(7'b0100000, 3'b000, rd, rs1, rs2);   // sub
             2:  return enc_r(7'b0000000, 3'b001, rd, rs1, rs2);   // sll
@@ -153,6 +198,9 @@ module testbench;
     // ---- ISS (RV32I: ALU subset, branches, jal, jalr) ----
     logic [31:0] iss_reg [32];
     logic [31:0] iss_pc;
+    logic [7:0]  init_mem [`MEM_SIZE_IN_BYTES];   // program image + data (what mem.sv starts with)
+    logic [7:0]  iss_mem  [`MEM_SIZE_IN_BYTES];   // the ISS's memory
+    longint      iss_ld = 0, iss_st = 0;
     longint      iss_branches;
 
     // execute the instruction at iss_pc. Returns 0 normally, 1 for WFI (or past the program),
@@ -160,7 +208,7 @@ module testbench;
     localparam int ISS_OK = 0, ISS_WFI = 1, ISS_EXC = 2;
     function automatic int iss_step(output int rd, output bit writes, output logic [31:0] value,
                                     output EXCEPTION exc);
-        logic [31:0] i  = imem[iss_pc >> 2];
+        logic [31:0] i  = (iss_pc < `MEM_SIZE_IN_BYTES) ? prog_word(int'(iss_pc >> 2)) : 32'h0;
         logic [31:0] a  = iss_reg[i[19:15]];
         logic [31:0] b  = iss_reg[i[24:20]];
         logic [31:0] im = {{20{i[31]}}, i[31:20]};
@@ -171,16 +219,43 @@ module testbench;
         writes = 1;
         value  = 'x;
         exc    = EXC_NONE;
-        if ((iss_pc >> 2) >= prog_len || i == WFI) begin
+        if (iss_pc >= `MEM_SIZE_IN_BYTES) begin   // fetch outside memory
+            writes = 0; exc = EXC_ACCESS; return ISS_EXC;
+        end
+        if (i == WFI) begin
             writes = 0;
             return ISS_WFI;
         end
         // legal instructions this core has no unit for yet, and a known-illegal word
-        if (i[6:0] == 7'b0000011 || i[6:0] == 7'b0100011 || i[6:0] == 7'b1010011) begin
+        if (i[6:0] == 7'b1010011) begin
             writes = 0; exc = EXC_UNSUPPORTED; return ISS_EXC;
         end
-        if (i[6:0] == 7'b1111111) begin
+        if (i[6:0] == 7'b1111111 || i == 32'h0) begin
             writes = 0; exc = EXC_ILLEGAL; return ISS_EXC;
+        end
+        if (i[6:0] == 7'b0000011 || i[6:0] == 7'b0100011) begin                // loads / stores
+            automatic bit          st   = (i[6:0] == 7'b0100011);
+            automatic logic [31:0] addr = st ? a + {{20{i[31]}}, i[31:25], i[11:7]} : a + im;
+            automatic int          n    = 1 << i[13:12];
+            automatic logic [31:0] raw  = '0;
+            if (i[14:12] == 3'b011 || i[14:12] == 3'b110 || i[14:12] == 3'b111 || (st && i[14])) begin
+                writes = 0; exc = EXC_ILLEGAL; return ISS_EXC;
+            end
+            if ((n == 2 && addr[0]) || (n == 4 && addr[1:0] != 0)) begin writes = 0; exc = EXC_MISALIGNED; return ISS_EXC; end
+            if (addr >= `MEM_SIZE_IN_BYTES)                       begin writes = 0; exc = EXC_ACCESS;     return ISS_EXC; end
+            if (st) begin
+                for (int k = 0; k < n; k++) iss_mem[int'(addr) + k] = b[8 * k +: 8];
+                writes = 0; iss_st++;
+            end else begin
+                for (int k = 0; k < n; k++) raw[8 * k +: 8] = iss_mem[int'(addr) + k];
+                value = (n == 4) ? raw : i[14] ? raw & ((1 << (8 * n)) - 1)
+                                               : (n == 1 ? {{24{raw[7]}}, raw[7:0]} : {{16{raw[15]}}, raw[15:0]});
+                iss_ld++;
+            end
+            if (rd == 0) writes = 0;
+            else if (writes) iss_reg[rd] = value;
+            iss_pc = npc;
+            return ISS_OK;
         end
         case (i[6:0])
             7'b0110111: value = {i[31:12], 12'b0};                     // lui
@@ -259,6 +334,7 @@ module testbench;
     function automatic void iss_reset();
         for (int r = 0; r < 32; r++) iss_reg[r] = 0;
         iss_pc = 0;
+        iss_mem = init_mem;
     endfunction
 
     // dynamic length of the program (the ISS run to the WFI or exception), and how it ends
@@ -272,7 +348,7 @@ module testbench;
         iss_reset();
         while (iss_step(rd, writes, value, e) == ISS_OK) begin
             n++;
-            if (n > 1000000) $fatal(1, "ISS: program does not terminate");
+            if (n > 50000000) $fatal(1, "ISS: program does not terminate");
         end
         end_exc = e;
         end_pc  = iss_pc;
@@ -346,6 +422,8 @@ module testbench;
             emit(enc_u(7'b0110111, r, 20'($urandom)));
             emit(enc_i(3'b000, r, r, 12'($urandom)));
         end
+        emit(enc_u(7'b0110111, DREG, 20'(DBASE >> 12)));   // x28 = data region
+        emit(enc_i(3'b000, DREG, DREG, 12'(DBASE)));
     endtask
 
     // one random block that keeps control flow inside itself; dlo..dhi = destination regs
@@ -396,8 +474,11 @@ module testbench;
     longint total_cycles = 0, total_committed = 0, total_branches = 0, total_flushes = 0;
     longint stall_rob = 0, stall_rs = 0, stall_freelist = 0;
     int     n_exc_programs = 0;
+    longint total_istall = 0;      // cycles fetch waited for the I-cache
+    longint total_ld = 0, total_st = 0, total_fwd = 0;
     longint iss_m = 0, total_m = 0;   // M-extension instructions executed
     longint last_flushes, last_branches, last_cycles, last_committed, last_ret_misp;
+    longint total_replays = 0, last_replays;   // memory-order violations (load replays)
 
     task automatic fail(input string msg);
         $display("  FAIL: %s", msg);
@@ -420,21 +501,57 @@ module testbench;
         if (count[0] != 0) fail($sformatf("[%s] p0 is in the retirement map or free list", name));
     endtask
 
-    task automatic run_program(input string name);
-        int cycles = 0, committed = 0, rd, flushes = 0, how, ret_misp = 0;
+    task automatic check_memory(input string name);
+        automatic int nbad = 0;
+        localparam int SETS = `DC_SZ / (`DC_BLK * `DC_WAYS);
+        logic [7:0] actual [`MEM_SIZE_IN_BYTES];
+        for (int k = 0; k < `MEM_64BIT_LINES; k++)
+            for (int b = 0; b < 8; b++) actual[8 * k + b] = memory.unified_memory[k][8 * b +: 8];
+        for (int st = 0; st < SETS; st++)
+            for (int w = 0; w < `DC_WAYS; w++)
+                if (dut.dcache_0.lines[st][w].valid && dut.dcache_0.lines[st][w].dirty) begin
+                    automatic int base = (int'(dut.dcache_0.lines[st][w].tag) * SETS + st) * 8;
+                    for (int b = 0; b < 8; b++) actual[base + b] = dut.dcache_0.lines[st][w].data[8 * b +: 8];
+                end
+        for (int a = 0; a < `MEM_SIZE_IN_BYTES; a++)
+            if (actual[a] !== iss_mem[a]) begin
+                if (nbad < 4) fail($sformatf("[%s] memory byte %h = %h, expected %h", name, a, actual[a], iss_mem[a]));
+                nbad++;
+            end
+    endtask
+
+    string prog_file;
+    int    trace_fd = 0;    // +trace=<file>: one line per committed instruction (pc, rd, value)
+
+    task automatic run_program(input string name, input bit from_file = 0);
+        int cycles = 0, committed = 0, rd, flushes = 0, how, ret_misp = 0, replays = 0;
         bit writes, done = 0;
         EXCEPTION e;
         logic [31:0] value;
         int expect_n, limit;
 
-        emit(WFI);
-        emit_functions();                 // after the WFI: reached only through calls
+        if (!from_file) begin                 // (a loaded image is already in init_mem and imem)
+            emit(WFI);
+            emit_functions();                 // after the WFI: reached only through calls
+            // memory image: the program, zeros, and random data at 0x8000..0x9fff
+            for (int a = 0; a < `MEM_SIZE_IN_BYTES; a += 4) begin
+                automatic logic [31:0] w = prog_word(a / 4);
+                for (int k = 0; k < 4; k++)
+                    init_mem[a + k] = (a >= DBASE && a < DBASE + 'h2000) ? 8'($urandom) : w[8 * k +: 8];
+            end
+        end
+        iss_ld = 0; iss_st = 0;
         iss_branches = 0;
         expect_n = iss_count();
         iss_m = 0;
         limit = 60 * expect_n + 2000;
         iss_reset();
         iss_branches = 0;
+
+        iss_ld = 0; iss_st = 0;
+        // load the image into mem.sv (64-bit lines, little-endian)
+        for (int k = 0; k < `MEM_64BIT_LINES; k++)
+            for (int b = 0; b < 8; b++) memory.unified_memory[k][8 * b +: 8] = init_mem[8 * k + b];
 
         reset = 1;
         @(negedge clock);
@@ -444,7 +561,10 @@ module testbench;
         while (!done) begin
             @(negedge clock);
             cycles++;
-            if (dut.flush) begin
+            if (!dut.fetch_stop && dut.pc_in_range && !dut.icache_valid) total_istall++;
+            total_fwd += $countones(dut.lsq_0.can_fwd);
+            if (dut.replay_flush) replays++;
+            else if (dut.flush) begin
                 flushes++;
                 // the mispredicting instruction is the youngest one committing this cycle
                 for (int i = W - 1; i >= 0; i--)
@@ -468,6 +588,7 @@ module testbench;
                     fail($sformatf("[%s] commit %0d: PC %h, expected %h", name, committed, commit_pc[i], iss_pc));
                 how = iss_step(rd, writes, value, e);
                 committed++;
+                if (trace_fd != 0) $fdisplay(trace_fd, "%h %0d %h", commit_pc[i], writes ? rd : 0, writes ? value : 32'h0);
                 if (dut.commit_exception[i] !== e)
                     fail($sformatf("[%s] PC %h (%h): commit_exception=%s, expected %s", name, commit_pc[i],
                                    imem[commit_pc[i] >> 2], dut.commit_exception[i].name(), e.name()));
@@ -507,6 +628,14 @@ module testbench;
             if (dut.prf_0.registers[dut.retire_map[r]] !== iss_reg[r])
                 fail($sformatf("[%s] final x%0d = %h, expected %h", name, r,
                                dut.prf_0.registers[dut.retire_map[r]], iss_reg[r]));
+        // committed stores may still be draining: wait, then memory = mem.sv + dirty D-cache blocks
+        begin
+            automatic int g = 0;
+            while ((stores_pending || dut.dcache_0.state != 0) && g < 2000) begin @(negedge clock); g++; end
+            if (g >= 2000) fail($sformatf("[%s] committed stores never drained", name));
+            check_memory(name);
+        end
+        total_ld += iss_ld; total_st += iss_st;
         if (end_exc == EXC_NONE) check_tags(name);    // after an exception, younger work is still in flight
         else n_exc_programs++;
 
@@ -515,6 +644,8 @@ module testbench;
         total_branches  += iss_branches;
         total_flushes   += flushes;
         total_m         += iss_m;
+        total_replays   += replays;
+        last_replays     = replays;
         last_flushes     = flushes;
         last_branches    = iss_branches;
         last_cycles      = cycles;
@@ -529,6 +660,20 @@ module testbench;
         prog_len = 0;
         $display("Config: W=%0d, ALU ports=%0d, branch ports=%0d, CDBs=%0d, issue width=%0d, ROB=%0d, RS=%0d, PRF=%0d",
                  W, `NUM_FU_ALU, `NUM_FU_BRANCH, `NUM_CDB, `ISSUE_WIDTH, `ROB_SZ, `RS_SZ, `PHYS_REG_SZ);
+
+        // ---- one program from a file ----
+        if ($value$plusargs("program=%s", prog_file)) begin
+            foreach (init_mem[a]) init_mem[a] = 8'h0;
+            $readmemh(prog_file, init_mem);
+            for (int k = 0; k < MAXN; k++) imem[k] = {init_mem[4 * k + 3], init_mem[4 * k + 2], init_mem[4 * k + 1], init_mem[4 * k]};
+            prog_len = MAXN;
+            $display("Program %s", prog_file);
+            if ($value$plusargs("trace=%s", prog_file)) trace_fd = $fopen(prog_file, "w");
+            void'($value$plusargs("program=%s", prog_file));
+            run_program(prog_file, 1);
+            if (trace_fd != 0) $fclose(trace_fd);
+            report();
+        end
 
         // ---- straight-line (from the first slice) ----
         $display("Test 1: dependent chain (addi x1, x1, 1) x 200");
@@ -603,8 +748,10 @@ module testbench;
         run_program("wrong-path junk");
 
         $display("Test 9: exceptions on the correct path stop the core at the right PC");
-        start_program(); emit(enc_i(3'b000, 2, 0, 12'd5)); emit(32'h00002083); emit(enc_i(3'b000, 3, 0, 12'd1));
-        run_program("correct-path lw");
+        start_program(); emit(enc_i(3'b000, 2, 0, 12'd5)); emit(enc_load(3'b010, 1, DREG, 12'd1)); emit(enc_i(3'b000, 3, 0, 12'd1));
+        run_program("correct-path misaligned lw");
+        start_program(); emit(enc_u(7'b0110111, 9, 20'h10)); emit(enc_store(3'b000, 5, 9, 12'd0));
+        run_program("correct-path sb outside memory");
         start_program(); emit(32'hffff_ffff); emit(enc_i(3'b000, 3, 0, 12'd1));
         run_program("correct-path illegal");
         start_program(); emit({7'b0000000, 5'd2, 5'd1, 3'b111, 5'd3, 7'b1010011});
@@ -616,9 +763,14 @@ module testbench;
         start_program(); emit(enc_i(3'b000, 6, 0, 12'd6)); emit(enc_jalr(1, 6, 0));
         run_program("correct-path misaligned jalr");
 
+        // 0x12000: outside the 64 KB memory, and its low 16 bits alias to a block that is not cached,
+        // so sending it to the I-cache would wait forever for mem.sv
+        start_program(); emit(enc_u(7'b0110111, 6, 20'h12)); emit(enc_jalr(0, 6, 0));   // jump to 0x12000
+        run_program("correct-path jump outside memory (EXC_ACCESS at the target)");
+
         $display("Test 10: exception in slot 0 with a mispredicting branch in slot 1 -> exception, no flush");
         start_program();
-        emit(32'h00002083);                           // slot 0: lw
+        emit(32'hffff_ffff);                          // slot 0: illegal
         emit(enc_b(3'b000, 0, 0, 8));                 // slot 1: taken
         emit(enc_i(3'b000, 3, 0, 12'd1));
         emit(enc_i(3'b000, 4, 0, 12'd1));
@@ -781,7 +933,78 @@ module testbench;
             fail($sformatf("hot loop: %0d mispredicts; a trained BTB + bimodal should miss only while warming up", last_flushes));
 
         // ---- random ----
-        $display("Test 19: 300 random programs (branches, jumps, loops, calls, wrong-path junk; x0..x7)");
+        // ---- loads and stores ----
+        $display("Test 21: store then load, every size: forwarding and sign/zero extension");
+        start_program();
+        emit(enc_u(7'b0110111, 5, 20'h8badf)); emit(enc_i(3'b000, 5, 5, 12'h0c9));   // x5 = 0x8badf0c9
+        emit(enc_store(3'b010, 5, DREG, 12'd8));
+        for (int f = 0; f < 6; f++) if (f != 3) emit(enc_load(3'(f), 10 + f, DREG, 12'(8 + (f % 3 == 1 ? 2 : f % 3 == 0 ? 3 : 0))));
+        emit(enc_store(3'b001, 5, DREG, 12'd16)); emit(enc_load(3'b001, 20, DREG, 12'd16)); emit(enc_load(3'b101, 21, DREG, 12'd16));
+        emit(enc_store(3'b000, 5, DREG, 12'd21)); emit(enc_load(3'b000, 22, DREG, 12'd21)); emit(enc_load(3'b100, 23, DREG, 12'd21));
+        run_program("forwarding");
+
+        $display("Test 22: partial overlap (byte store, then word load of the same word)");
+        start_program();
+        emit(enc_store(3'b000, 5, DREG, 12'd33)); emit(enc_load(3'b010, 6, DREG, 12'd32));
+        emit(enc_store(3'b001, 7, DREG, 12'd38)); emit(enc_load(3'b010, 8, DREG, 12'd36));
+        run_program("partial overlap");
+
+        $display("Test 23: store address from a slow divide; a later same-address load is replayed (or waits)");
+        start_program();
+        emit(enc_i(3'b000, 11, 0, 12'd1));
+        emit(enc_r(7'b0000001, 3'b101, 9, DREG, 11));             // x9 = x28 / 1 (34 cycles)
+        emit(enc_store(3'b010, 5, 9, 12'd4));                      // address unknown for a while
+        emit(enc_load(3'b010, 6, DREG, 12'd4));                    // same address
+        emit(enc_load(3'b010, 7, DREG, 12'd12));                   // different address
+        run_program("unknown store address");
+        $display("  (%0d load replays)", last_replays);
+        if (last_replays != (`LSQ_SPECULATE ? 1 : 0))
+            fail($sformatf("unknown store address: %0d replays, expected %0d (only the same-address load violates)",
+                           last_replays, `LSQ_SPECULATE ? 1 : 0));
+
+        $display("Test 23b: the same conflict in a 20-iteration loop: replayed every time, or (LSQ_SPECULATE = 2) once");
+        start_program();
+        emit(enc_i(3'b000, 11, 0, 12'd1));
+        emit(enc_i(3'b000, 7, 0, 12'd20));                         // x7 = iterations
+        emit(enc_r(7'b0000001, 3'b101, 9, DREG, 11));             // loop: x9 = x28 / 1 (34 cycles)
+        emit(enc_store(3'b010, 5, 9, 12'd4));                      // store address waits for the divide
+        emit(enc_load(3'b010, 6, DREG, 12'd4));                    // same address, known at once
+        emit(enc_i(3'b000, 5, 5, 12'd1));                          // a new value every iteration
+        emit(enc_i(3'b000, 7, 7, -12'd1));
+        emit(enc_b(3'b001, 7, 0, -20));                            // bne x7, x0, loop
+        run_program("loop conflict");
+        $display("  (%0d load replays in 20 iterations)", last_replays);
+        if (`LSQ_SPECULATE == 0 && last_replays != 0)  fail($sformatf("loop conflict: %0d replays without speculation", last_replays));
+        if (`LSQ_SPECULATE == 1 && last_replays < 15)  fail($sformatf("loop conflict: only %0d replays: the loads should run ahead", last_replays));
+        if (`LSQ_SPECULATE == 2 && last_replays > 2)   fail($sformatf("loop conflict: %0d replays: the load-wait table should stop them", last_replays));
+
+        $display("Test 24: 24 stores (more than the store queue), then read them all back");
+        start_program();
+        for (int n = 0; n < 24; n++) emit(enc_store(3'b010, 1 + n % 7, DREG, 12'(4 * (n % 16))));
+        for (int n = 0; n < 16; n++) emit(enc_load(3'b010, 1 + n % 7, DREG, 12'(4 * n)));
+        run_program("store queue full");
+
+        $display("Test 25: a store on a mispredicted path must never reach memory");
+        start_program();
+        emit(enc_b(3'b000, 0, 0, 12));                             // taken
+        emit(enc_store(3'b010, 5, DREG, 12'd0));                   // wrong path
+        emit(enc_store(3'b000, 5, 0, 12'd0));                      // wrong path, into code
+        emit(enc_load(3'b010, 6, DREG, 12'd0));
+        run_program("wrong-path stores");
+
+        $display("Test 26: D-cache evictions: 16 blocks that all map to one set, written then read");
+        start_program();
+        for (int n = 0; n < 16; n++) begin
+            emit(enc_u(7'b0110111, 9, 20'((DBASE + 128 * n) >> 12))); emit(enc_i(3'b000, 9, 9, 12'(DBASE + 128 * n)));
+            emit(enc_store(3'b010, 1 + n % 7, 9, 12'd0));
+        end
+        for (int n = 0; n < 16; n++) begin
+            emit(enc_u(7'b0110111, 9, 20'((DBASE + 128 * n) >> 12))); emit(enc_i(3'b000, 9, 9, 12'(DBASE + 128 * n)));
+            emit(enc_load(3'b010, 10, 9, 12'd0));
+        end
+        run_program("evictions");
+
+        $display("Test 27: 300 random programs (branches, jumps, loops, calls, wrong-path junk; x0..x7)");
         for (int p = 0; p < 300; p++) begin
             start_program();
             while (prog_len < 62 + 250) emit_block(0, 7, 1);
@@ -789,7 +1012,7 @@ module testbench;
             if (errors > 0) break;
         end
 
-        $display("Test 20: 20 long random programs (x0..x31 straight-line + branch blocks)");
+        $display("Test 28: 20 long random programs (x0..x31 straight-line + branch blocks)");
         for (int p = 0; p < 20; p++) begin
             start_program();
             while (prog_len < 62 + 2000) begin
@@ -800,6 +1023,10 @@ module testbench;
             if (errors > 0) break;
         end
 
+        report();
+    end
+
+    task automatic report();
         $display("  (IPC: %0d instructions / %0d cycles = %.2f)",
                  total_committed, total_cycles, real'(total_committed) / real'(total_cycles));
         $display("  (branches/jumps: %0d, mispredicts: %0d = %.1f%%; random code runs most branches once)",
@@ -808,9 +1035,13 @@ module testbench;
                  stall_rob, stall_rs, stall_freelist);
         $display("  (%0d programs ended in an exception, as expected)", n_exc_programs);
         $display("  (multiply/divide instructions executed: %0d)", total_m);
+        $display("  (I-cache: fetch waited %0d of %0d cycles)", total_istall, total_cycles);
+        $display("  (loads %0d, stores %0d committed; %0d loads forwarded from the store queue; D-cache %0d hits, %0d misses, %0d writebacks)",
+                 total_ld, total_st, total_fwd, dut.dcache_0.n_hits, dut.dcache_0.n_misses, dut.dcache_0.n_writebacks);
+        $display("  (LSQ_SPECULATE = %0d: %0d load replays)", `LSQ_SPECULATE, total_replays);
         if (errors == 0) $display("@@@ Passed");
         else             $display("@@@ Failed (%0d errors)", errors);
         $finish;
-    end
+    endtask
 
 endmodule
