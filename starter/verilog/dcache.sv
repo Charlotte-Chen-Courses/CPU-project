@@ -102,7 +102,8 @@ module dcache #(
   function automatic logic [63:0] merge(input logic [63:0] blk, input logic [2:0] off, input MEM_SIZE s,
                                         input logic [`XLEN-1:0] d);
     automatic int n = (s == BYTE) ? 1 : (s == HALF) ? 2 : 4;
-    for (int k = 0; k < n; k++) blk[8 * (int'(off) + k) +: 8] = d[8 * k +: 8];
+    for (int k = 0; k < 4; k++)   // constant bound: synthesis must unroll it
+      if (k < n) blk[8 * (int'(off) + k) +: 8] = d[8 * k +: 8];
     return blk;
   endfunction
 

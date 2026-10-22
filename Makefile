@@ -79,7 +79,7 @@ VERILATOR_FLAGS := --binary --timing -j 0 -Wall -Wno-fatal \
 
 HEADERS := $(wildcard $(SRC)/verilog/*.svh)
 
-.PHONY: test clean $(TESTS:%=tb_%) $(TESTS:%=lint_%)
+.PHONY: test clean synth_local $(TESTS:%=tb_%) $(TESTS:%=lint_%)
 
 test: $(TESTS:%=tb_%)
 
@@ -101,6 +101,43 @@ $(BUILD)/%/Vtestbench: $(SRC)/test/$$(or $$(BASE_$$*),$$*)_test.sv $(SRC)/verilo
 $(TESTS:%=lint_%): lint_%:
 	$(VERILATOR) --lint-only -Wall -I$(SRC) +define+CLOCK_PERIOD=$(CLOCK_PERIOD) \
 		$(SRC)/verilog/$*.sv $(DEPS_$*)
+
+# ---- local synthesis (open source): Yosys + slang (SystemVerilog) + ABC, ASAP7 ----
+# Quick what-if area / rough-timing estimates on this machine. The numbers to report come from
+# Design Compiler on cadpc12; this optimizer differs, so compare local runs with each other.
+# Needs synth_local/lib/ (gitignored): asap7sc7p5t_merged_RVT_FF_nldm_211120.lib. The I-cache
+# SRAM bank is a black box (synth_local/srambank_*_blackbox.sv); add its LEF area by hand:
+# 1244.2 um^2. read_slang needs --single-unit: sys_defs.svh defines functions outside any module,
+# and one copy per file's compilation unit breaks the import (duplicate wire assert).
+#   make synth_local                      the whole core at SYNTH_PERIOD ps
+#   make synth_local SYNTH_TOP=rs         one module (out-of-context)
+SYNTH_TOP    ?= cpu
+SYNTH_PERIOD ?= 1000
+SYNTH_LIB    := synth_local/lib/asap7sc7p5t_merged_RVT_FF_nldm_211120.lib
+SYNTH_SRAM   := synth_local/srambank_128x4x64_6t122_blackbox.sv
+SYNTH_OUT    := synth_local/out/$(SYNTH_TOP)_$(SYNTH_PERIOD)
+SYNTH_SRCS    = $(filter-out %.vlt $(SRC)/test/% $(ICACHE_SRAM_MODEL),$(DEPS_cpu)) $(SRC)/verilog/cpu.sv
+YOSYS        ?= yosys
+
+synth_local: $(SYNTH_SRCS) $(HEADERS) $(SYNTH_LIB) $(SYNTH_SRAM)
+	@mkdir -p $(SYNTH_OUT)
+	$(YOSYS) -m slang -q -l $(SYNTH_OUT)/yosys.log -p " \
+	  read_slang -I $(SRC) -I $(SRC)/vendor/cvfpu/src/common_cells/include -D SYNTHESIS \
+	             --single-unit --unroll-limit=1000000 \
+	             --translate-off-format synopsys,translate_off,translate_on \
+	             --top $(SYNTH_TOP) $(SYNTH_SRAM) $(SYNTH_SRCS); \
+	  hierarchy -top $(SYNTH_TOP); \
+	  tee -q -o $(SYNTH_OUT)/stat_hier.txt stat; \
+	  synth -top $(SYNTH_TOP) -flatten; \
+	  dfflibmap -liberty $(SYNTH_LIB); \
+	  abc -liberty $(SYNTH_LIB) -D $(SYNTH_PERIOD); \
+	  opt_clean; \
+	  tee -o $(SYNTH_OUT)/area.txt stat -liberty $(SYNTH_LIB)"
+	@grep -E "Chip area|Number of cells" $(SYNTH_OUT)/area.txt | head -3
+
+# print a variable: make print-SYNTH_SRCS
+print-%:
+	@echo $($*)
 
 clean:
 	rm -rf $(BUILD)

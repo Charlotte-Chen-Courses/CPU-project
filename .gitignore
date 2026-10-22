@@ -1,2 +1,4 @@
 build/
 docs/
+synth_local/lib/
+synth_local/out/
