@@ -37,7 +37,7 @@ module testbench;
     MEM_SIZE                req_size;
     logic [`DMEM_ID_W-1:0]  req_id, resp_id;
     // I-cache CPU side
-    logic [`XLEN-1:0]       fetch_addr;
+    logic [`XLEN-1:0]       fetch_addr, next_fetch;   // next_fetch: fetch_addr after the next edge
     logic [63:0]            icache_data;
     logic                   icache_valid;
     // cache <-> arbiter
@@ -61,7 +61,7 @@ module testbench;
     icache icache_0 (
         .clock, .reset,
         .Imem2proc_response(i_response), .Imem2proc_data(rdata), .Imem2proc_tag(i_tag),
-        .proc2Icache_addr(fetch_addr),
+        .proc2Icache_addr(fetch_addr), .next_addr(next_fetch),
         .proc2Imem_command(i_command), .proc2Imem_addr(i_addr),
         .Icache_data_out(icache_data), .Icache_valid_out(icache_valid)
     );
@@ -132,7 +132,6 @@ module testbench;
     int  n_ifetch = 0, n_abandon = 0, i_wait = 0, i_max_wait = 0;
     bit  running = 0;
     bit  may_abandon = 1;   // 0: like a real fetch stage, wait for every miss (no address change)
-    logic [`XLEN-1:0] next_fetch;
     always @(posedge clock) fetch_addr <= next_fetch;
     always @(negedge clock) begin
         next_fetch = fetch_addr;

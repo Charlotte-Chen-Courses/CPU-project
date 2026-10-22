@@ -86,7 +86,7 @@ module cpu #(
 );
 
   // ---------------- fetch ----------------
-  logic [`XLEN-1:0]        pc;
+  logic [`XLEN-1:0]        pc, pc_next;      // pc_next: the PC register's next value
   logic                    fetch_stop;     // WFI dispatched: fetch nothing more
   logic                    fire;
   logic [W-1:0]            fetch_valid;
@@ -123,6 +123,7 @@ module cpu #(
       .Imem2proc_data    (mem_rdata),
       .Imem2proc_tag     (i_tag),
       .proc2Icache_addr  (pc_in_range ? pc : '0),
+      .next_addr         (pc_next < `MEM_SIZE_IN_BYTES ? pc_next : '0),   // (the SRAM reads it a cycle early)
       .proc2Imem_command (i_command),
       .proc2Imem_addr    (i_addr),
       .Icache_data_out   (icache_block),
@@ -298,17 +299,16 @@ module cpu #(
       .fp_recover_map (fp_retire_map_next)
   );
 
+  always_comb
+    if (reset)      pc_next = '0;
+    else if (flush) pc_next = redirect_pc;
+    else if (fire)  pc_next = fetch_next_pc;
+    else            pc_next = pc;
+
   always_ff @(posedge clock) begin
-    if (reset) begin
-      pc         <= '0;
-      fetch_stop <= `FALSE;
-    end else if (flush) begin
-      pc         <= redirect_pc;
-      fetch_stop <= `FALSE;           // a WFI fetched on the wrong path may have set it
-    end else if (fire) begin
-      pc <= fetch_next_pc;
-      if (|(disp_valid & disp_halt)) fetch_stop <= `TRUE;
-    end
+    pc <= pc_next;
+    if (reset || flush) fetch_stop <= `FALSE;   // (a WFI fetched on a wrong path may have set it)
+    else if (fire && |(disp_valid & disp_halt)) fetch_stop <= `TRUE;
   end
 
   // ---------------- ROB ----------------

@@ -64,8 +64,13 @@
 // is replayed; all bits clear every LWT_CLEAR cycles so stale predictions expire (Alpha 21264)
 `define LWT_SZ    64     // power of 2
 `define LWT_CLEAR 16384
+// instruction cache: direct-mapped, 8-byte lines. ICACHE_SRAM = 1 keeps the data in the ASAP7
+// SRAM bank (synchronous read: needs ICACHE_LINES = 512, i.e. 4 KB); 0 keeps it in flip-flops
+// (combinational read, any power-of-2 size, for sweeps)
+`define ICACHE_LINES 512
+`define ICACHE_SRAM  1
 // data cache (sizes in bytes; powers of 2). Blocks match mem.sv's 64-bit bus.
-`define DC_SZ   256
+`define DC_SZ   4096
 `define DC_WAYS 2
 `define DC_BLK  8
 

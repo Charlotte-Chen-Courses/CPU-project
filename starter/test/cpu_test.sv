@@ -1278,12 +1278,12 @@ module testbench;
 
         $display("Test 26: D-cache evictions: 16 blocks that all map to one set, written then read");
         start_program();
-        for (int n = 0; n < 16; n++) begin
-            emit(enc_u(7'b0110111, 9, 20'((DBASE + 128 * n) >> 12))); emit(enc_i(3'b000, 9, 9, 12'(DBASE + 128 * n)));
+        for (int n = 0; n < 16; n++) begin                  // one way's worth of bytes apart: same set
+            xconst(9, DBASE + n * (`DC_SZ / `DC_WAYS));
             emit(enc_store(3'b010, 1 + n % 7, 9, 12'd0));
         end
         for (int n = 0; n < 16; n++) begin
-            emit(enc_u(7'b0110111, 9, 20'((DBASE + 128 * n) >> 12))); emit(enc_i(3'b000, 9, 9, 12'(DBASE + 128 * n)));
+            xconst(9, DBASE + n * (`DC_SZ / `DC_WAYS));
             emit(enc_load(3'b010, 10, 9, 12'd0));
         end
         run_program("evictions");

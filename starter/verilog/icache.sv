@@ -3,22 +3,27 @@
 //   Modulename :  icache.sv                                           //
 //                                                                     //
 //  Description :  The instruction cache module that reroutes memory   //
-//                 accesses to decrease misses.                        //
+//                 accesses to decrease misses. Direct-mapped, 8-byte  //
+//                 lines, ICACHE_LINES lines (sys_defs). Tags and      //
+//                 valid bits are flip-flops (read combinationally:    //
+//                 a tag miss starts the memory request). Data:        //
+//                  - ICACHE_SRAM = 1: the ASAP7 SRAM bank (4 KB,      //
+//                    synchronous read). It is read at next_addr, the  //
+//                    address the fetch stage presents NEXT cycle, so  //
+//                    its output lines up with proc2Icache_addr; data  //
+//                    counts only if that read was for this index (a   //
+//                    refill writes the bank and is re-read the next   //
+//                    cycle: one bubble per miss).                     //
+//                  - ICACHE_SRAM = 0: flip-flops, combinational read  //
+//                    (next_addr unused), any size.                    //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
 `include "verilog/sys_defs.svh"
 
 // Internal macros, no other file should need these
-`define CACHE_LINES 32
+`define CACHE_LINES `ICACHE_LINES
 `define CACHE_LINE_BITS $clog2(`CACHE_LINES)
-
-typedef struct packed {
-    logic [63:0]                  data;
-    // (13 bits) since only need 16 bits to access all memory and 3 are the offset
-    logic [12-`CACHE_LINE_BITS:0] tags;
-    logic                         valid;
-} ICACHE_ENTRY;
 
 /**
  * A quick overview of the cache and memory:
@@ -55,6 +60,7 @@ module icache (
 
     // From fetch stage
     input [`XLEN-1:0] proc2Icache_addr,
+    input [`XLEN-1:0] next_addr,          // proc2Icache_addr in the next cycle (SRAM read address)
 
     // To memory
     output logic [1:0]       proc2Imem_command,
@@ -65,21 +71,23 @@ module icache (
     output logic        Icache_valid_out // When valid is high
 );
 
-    // ---- Cache data ---- //
+    // ---- Tags (13 bits of line address, since only 16 bits address all memory) ---- //
 
-    ICACHE_ENTRY [`CACHE_LINES-1:0] icache_data;
+    logic [12-`CACHE_LINE_BITS:0] tags [`CACHE_LINES];
+    logic [`CACHE_LINES-1:0]      valids;
 
     // ---- Addresses and final outputs ---- //
 
     // Note: cache tags, not memory tags
     logic [12-`CACHE_LINE_BITS:0] current_tag, last_tag;
-    logic [`CACHE_LINE_BITS - 1:0] current_index, last_index;
+    logic [`CACHE_LINE_BITS - 1:0] current_index, last_index, next_index;
+    logic tag_hit, data_ok;
 
     assign {current_tag, current_index} = proc2Icache_addr[15:3];
+    assign next_index = next_addr[3 +: `CACHE_LINE_BITS];
 
-    assign Icache_data_out = icache_data[current_index].data;
-    assign Icache_valid_out = icache_data[current_index].valid &&
-                              (icache_data[current_index].tags == current_tag);
+    assign tag_hit          = valids[current_index] && (tags[current_index] == current_tag);
+    assign Icache_valid_out = tag_hit && data_ok;
 
     // ---- Main cache logic ---- //
 
@@ -100,7 +108,8 @@ module icache (
 
     // If we have a new miss or still waiting for the response tag, we might
     // need to wait for the response tag because dcache has priority over icache
-    wire unanswered_miss = changed_addr ? !Icache_valid_out
+    // (a miss is a tag miss: data that is merely not read out yet is not one)
+    wire unanswered_miss = changed_addr ? !tag_hit
                                         : miss_outstanding && (Imem2proc_response == 0);
 
     // Keep sending memory requests until we receive a response tag or change addresses
@@ -115,7 +124,7 @@ module icache (
             last_tag         <= -1; // reset goes low because addr "changes"
             current_mem_tag  <= 0;
             miss_outstanding <= 0;
-            icache_data      <= 0; // Set all cache data to 0 (including valid bits)
+            valids           <= 0;
         end else begin
             last_index       <= current_index;
             last_tag         <= current_tag;
@@ -124,11 +133,38 @@ module icache (
                 current_mem_tag <= Imem2proc_response;
             end
             if (got_mem_data) begin // If data came from memory, meaning tag matches
-                icache_data[current_index].data  <= Imem2proc_data;
-                icache_data[current_index].tags  <= current_tag;
-                icache_data[current_index].valid <= 1;
+                tags[current_index]   <= current_tag;
+                valids[current_index] <= 1;
             end
         end
+    end
+
+    // ---- Cache data ---- //
+
+    if (`ICACHE_SRAM) begin : gen_sram
+        // ASAP7 srambank_128x4x64_6t122: 512 x 64, one port (a write blocks that cycle's read)
+        logic                         rd_ok;     // dataout holds the line read at the last edge
+        logic [`CACHE_LINE_BITS-1:0]  rd_index;  // ... from this index
+        srambank_128x4x64_6t122 data_0 (
+            .clk    (clock),
+            .ADDRESS(got_mem_data ? current_index : next_index),
+            .wd     (Imem2proc_data),
+            .banksel(1'b1),
+            .read   (!got_mem_data),
+            .write  (got_mem_data),
+            .dataout(Icache_data_out)
+        );
+        always_ff @(posedge clock) begin
+            if (reset) rd_ok <= 0;
+            else       rd_ok <= !got_mem_data;
+            rd_index <= next_index;
+        end
+        assign data_ok = rd_ok && (rd_index == current_index);
+    end else begin : gen_flops
+        logic [63:0] lines [`CACHE_LINES];
+        always_ff @(posedge clock) if (!reset && got_mem_data) lines[current_index] <= Imem2proc_data;
+        assign Icache_data_out = lines[current_index];
+        assign data_ok         = 1'b1;
     end
 
 endmodule // icache
