@@ -15,6 +15,11 @@
 //                 drained). tb_dmem answers with                      //
 //                 random latency,                                     //
 //                 out of order, and refuses requests at random.       //
+//                 Atomics (LR/SC/AMO) are issued between bursts, with //
+//                 nothing in flight but committed stores possibly     //
+//                 still draining; results, the atomic's own write and //
+//                 the reservation (cleared by SC or any store to its  //
+//                 word) are checked against a program-order model.    //
 //                 It also acts on violations like the ROB: the load   //
 //                 named by viol_* is marked, and at the head a marked //
 //                 load flushes instead of committing.                 //
@@ -131,10 +136,24 @@ module testbench;
         return -1;
     endfunction
 
-    // memory side: every store written must be the next committed one
+    // ---- atomics: reservation model and the atomic's own write ----
+    bit               tb_resv_v = 0;
+    logic [`XLEN-1:2] tb_resv_word;
+    bit               at_write_due = 0;            // after the drain, the next write is the atomic's
+    logic [`XLEN-1:0] at_write_addr, at_write_data;
+    int n_lr = 0, n_sc_ok = 0, n_sc_fail = 0, n_amo = 0, n_at_exc = 0, n_resv_store_clear = 0;
+
+    // memory side: every store written must be the next committed one (or the atomic's write)
     always @(posedge clock)
         if (!reset && dmem_req_valid && dmem_req_ready && dmem_req_store) begin
-            if (drainq.size() == 0) fail($sformatf("store to %h written to memory before it committed", dmem_req_addr));
+            // any store written to the reserved word clears the reservation
+            if (tb_resv_v && dmem_req_addr[`XLEN-1:2] == tb_resv_word) begin tb_resv_v = 0; n_resv_store_clear++; end
+            if (drainq.size() == 0 && at_write_due) begin
+                if (dmem_req_addr !== at_write_addr || dmem_req_size !== WORD || dmem_req_data !== at_write_data)
+                    fail($sformatf("atomic write %h/%0d/%h, expected %h/2/%h", dmem_req_addr, dmem_req_size, dmem_req_data,
+                                   at_write_addr, at_write_data));
+                at_write_due = 0;
+            end else if (drainq.size() == 0) fail($sformatf("store to %h written to memory before it committed", dmem_req_addr));
             else begin
                 automatic op_t s = drainq.pop_front();
                 automatic logic [`XLEN-1:0] m = (s.size == BYTE) ? 32'hff : (s.size == HALF) ? 32'hffff : '1;
@@ -143,6 +162,87 @@ module testbench;
                                    dmem_req_addr, dmem_req_size, dmem_req_data, s.addr, s.size, s.data));
             end
         end
+
+    function automatic logic [`XLEN-1:0] amo_ref(input logic [4:0] f5, input logic [`XLEN-1:0] m, input logic [`XLEN-1:0] r);
+        case (f5)
+            5'b00001: return r;
+            5'b00000: return m + r;
+            5'b00100: return m ^ r;
+            5'b01100: return m & r;
+            5'b01000: return m | r;
+            5'b10000: return ($signed(m) < $signed(r)) ? m : r;
+            5'b10100: return ($signed(m) > $signed(r)) ? m : r;
+            5'b11000: return (m < r) ? m : r;
+            default:  return (m > r) ? m : r;
+        endcase
+    endfunction
+
+    // one atomic, issued only with nothing in flight (as the core serializes them); committed
+    // stores may still be draining: the result is computed in program order
+    task automatic atomic_op();
+        logic [4:0] amos [] = '{5'b00001, 5'b00000, 5'b00100, 5'b01100, 5'b01000, 5'b10000, 5'b10100, 5'b11000, 5'b11100};
+        int         kind = $urandom_range(0, 9);
+        int         g = 0;
+        logic [4:0] f5 = (kind < 3) ? 5'b00010 : (kind < 6) ? 5'b00011 : amos[$urandom_range(0, 8)];
+        logic [`XLEN-1:0] addr = BASE + 4 * $urandom_range(0, 15), src, old = '0, exp_v = '0, wdata = '0;
+        logic [`TAG_W-1:0] tag = `TAG_W'($urandom_range(1, `PHYS_REG_SZ - 1));
+        EXCEPTION   x;
+        bit         wr = 0, got = 0;
+        if (f5 == 5'b00011 && tb_resv_v && $urandom % 3 != 0) addr = {tb_resv_word, 2'b00};   // SC to the LR word
+        case ($urandom % 30)
+            0: addr = addr | 32'($urandom_range(1, 3));                        // misaligned
+            1: addr = 32'h0001_0000 + 4 * $urandom_range(0, 63);               // out of range
+            default: ;
+        endcase
+        src = ($urandom % 2 == 1) ? $urandom : 32'($urandom_range(0, 20)) - 32'd10;
+        x   = exc_of(addr, WORD);
+        if (x == EXC_NONE) begin
+            for (int k = 0; k < 4; k++) old[8 * k +: 8] = arch[int'(addr) + k];
+            if (f5 == 5'b00010) begin exp_v = old; n_lr++; end
+            else if (f5 == 5'b00011) begin
+                automatic bit ok = tb_resv_v && tb_resv_word == addr[`XLEN-1:2];
+                foreach (drainq[i]) if (drainq[i].addr[`XLEN-1:2] == tb_resv_word) ok = 0;   // they are written first
+                exp_v = ok ? 0 : 1; wr = ok; wdata = src;
+                if (ok) n_sc_ok++; else n_sc_fail++;
+            end else begin exp_v = old; wr = 1; wdata = amo_ref(f5, old, src); n_amo++; end
+            if (wr) for (int k = 0; k < 4; k++) arch[int'(addr) + k] = wdata[8 * k +: 8];
+        end else n_at_exc++;
+        at_write_due = wr; at_write_addr = addr; at_write_data = wdata;
+        // drive: issue on the store port once it is ready, then wait for the result
+        disp_load = '0; disp_store = '0; commit_load = '0; commit_store = '0;
+        ld_in_valid = 0; flush = 0; ld_wait = 0; ld_out_grant = 1;
+        st_in_pkt = '0;
+        st_in_pkt.inst     = {f5, 2'($urandom), 5'd3, 5'd1, 3'b010, 5'd2, 7'b0101111};
+        st_in_pkt.dest_tag = tag;
+        st_in_pkt.rob_idx  = `ROB_IDX_W'(next_rob);
+        st_in_pkt.fu_type  = FU_STORE;
+        st_in_pkt.serial   = 1;
+        st_rs1 = addr; st_rs2 = src;
+        while (!st_ready && g++ < 200) begin st_out_grant = 1; @(posedge clock); @(negedge clock); end
+        st_in_valid = 1; st_out_grant = ($urandom % 2 == 1);
+        @(posedge clock); @(negedge clock);
+        st_in_valid = 0;
+        for (g = 0; g < 500 && !got; g++) begin
+            st_out_grant = ($urandom % 3 != 0);
+            #1;
+            if (st_out_valid && st_out_grant) begin
+                got = 1;
+                if (st_out_pkt.tag !== tag || st_out_pkt.rob_idx !== `ROB_IDX_W'(next_rob) || st_out_pkt.exception !== x ||
+                    (x == EXC_NONE && st_out_pkt.value !== exp_v))
+                    fail($sformatf("atomic f5=%b at %h (src %h): got %h exc %s, expected %h exc %s", f5, addr, src,
+                                   st_out_pkt.value, st_out_pkt.exception.name(), exp_v, x.name()));
+            end
+            @(posedge clock); @(negedge clock);
+        end
+        if (!got) fail($sformatf("atomic f5=%b at %h never completed", f5, addr));
+        if (at_write_due) fail($sformatf("atomic f5=%b at %h: its write never reached memory", f5, addr));
+        if (x == EXC_NONE) begin
+            if (f5 == 5'b00010) begin tb_resv_v = 1; tb_resv_word = addr[`XLEN-1:2]; end
+            if (f5 == 5'b00011) tb_resv_v = 0;
+        end
+        next_rob = (next_rob + 1) % (1 << `ROB_IDX_W);
+        st_out_grant = 0;
+    endtask
 
     // ---------------- one cycle ----------------
     bit allow_dispatch = 1, allow_flush = 1;
@@ -265,7 +365,7 @@ module testbench;
             else begin
                 if (ld_out_pkt.exception !== q[p].exc)
                     fail($sformatf("load rob %0d: exception %s, expected %s", q[p].rob, ld_out_pkt.exception.name(), q[p].exc.name()));
-                else if (q[p].exc == EXC_NONE && ((!`LSQ_SPECULATE && ld_out_pkt.value !== q[p].expect_v) || ld_out_pkt.tag !== q[p].tag))
+                else if (q[p].exc == EXC_NONE && ((`LSQ_SPECULATE == 0 && ld_out_pkt.value !== q[p].expect_v) || ld_out_pkt.tag !== q[p].tag))
                     fail($sformatf("load rob %0d %h/%0d%s: got %h (tag %0d), expected %h (tag %0d)", q[p].rob, q[p].addr,
                                    nb(q[p].size), q[p].uns ? "u" : "", ld_out_pkt.value, ld_out_pkt.tag, q[p].expect_v, q[p].tag));
                 if (q[p].done) fail($sformatf("load rob %0d broadcast twice", q[p].rob));
@@ -285,7 +385,7 @@ module testbench;
         end
         if (viol_valid) begin
             automatic int p = find_rob(int'(viol_rob_idx));
-            if (!`LSQ_SPECULATE) fail("violation reported with LSQ_SPECULATE = 0");
+            if (`LSQ_SPECULATE == 0) fail("violation reported with LSQ_SPECULATE = 0");
             if (p < 0 || !q[p].is_load || q[p].exc != EXC_NONE)
                 fail($sformatf("violation names rob %0d, which is not an in-flight load without an exception", viol_rob_idx));
             else if (p < n_commit) fail($sformatf("violation names rob %0d, which commits this cycle", viol_rob_idx));
@@ -389,10 +489,25 @@ module testbench;
             end
             $display("  (%0d of 200 had the forward and the store address in the same cycle; in %0d of 200 the source drained first)",
                      n_same, n_drained);
-            if (`LSQ_SPECULATE && (n_same < 50 || n_drained < 50)) fail("directed cases too rare");
+            if (`LSQ_SPECULATE != 0 && (n_same < 50 || n_drained < 50)) fail("directed cases too rare");
         end
 
-        $display("Test 6: drain (no new work, everything commits, committed stores reach memory)");
+        $display("Test 6: atomics between bursts of loads/stores (LR/SC/AMO; committed stores may still be draining)");
+        for (int r = 0; r < 800; r++) begin
+            automatic int burst = $urandom_range(3, 40);
+            automatic int g2 = 0;
+            for (int c = 0; c < burst; c++) step();
+            allow_dispatch = 0;                                          // nothing younger: older work commits
+            while (q.size() > 0 && g2++ < 2000) step();
+            allow_dispatch = 1;
+            repeat ($urandom_range(1, 3)) atomic_op();
+        end
+        $display("  (%0d LR, %0d SC succeeded, %0d SC failed, %0d AMOs, %0d atomics excepted, %0d reservations cleared by a store)",
+                 n_lr, n_sc_ok, n_sc_fail, n_amo, n_at_exc, n_resv_store_clear);
+        if (n_lr < 50 || n_sc_ok < 20 || n_sc_fail < 20 || n_amo < 100 || n_at_exc < 10 || n_resv_store_clear < 5)
+            fail("atomic coverage too low");
+
+        $display("Test 7: drain (no new work, everything commits, committed stores reach memory)");
         allow_dispatch = 0; allow_flush = 0;
         guard = 0;
         while (q.size() > 0 || stores_pending || drainq.size() > 0) begin
@@ -406,7 +521,7 @@ module testbench;
         $display("  (%0d loads and %0d stores completed, %0d flushes, %0d memory loads, %0d memory stores)",
                  n_loads, n_stores, n_flushes, dmem.n_loads, dmem.n_stores);
         $display("  (%0d loads committed; %0d replays, %0d of them of a wrong value)", n_ld_commit, n_replays, n_wrong_replayed);
-        if (`LSQ_SPECULATE && n_wrong_replayed == 0) fail("speculation never produced a wrong value: the replay path is untested");
+        if (`LSQ_SPECULATE != 0 && n_wrong_replayed == 0) fail("speculation never produced a wrong value: the replay path is untested");
         if (errors == 0) $display("@@@ Passed");
         else             $display("@@@ Failed (%0d errors)", errors);
         $finish;

@@ -171,7 +171,7 @@ module testbench;
             check("fence.i", I(3'b001, 7'b0001111), E(FU_ALU, 0));
             for (int f3 = 1; f3 < 8; f3++) begin
                 if (f3 == 4) continue;
-                e = E(FU_ALU, 0); e.csr = 1;
+                e = E(FU_ALU, 1); e.csr = 1;
                 check($sformatf("csr f3=%0d", f3), I(3'(f3), 7'b1110011), e);
             end
 

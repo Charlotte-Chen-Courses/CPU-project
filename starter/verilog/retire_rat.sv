@@ -17,6 +17,8 @@
 `include "verilog/sys_defs.svh"
 
 module retire_rat #(
+    parameter  BASE   = 0,             // first tag of this register class: reset map[i] = BASE + i
+    parameter  bit ZERO_REG = 1'b1,    // register 0 is never remapped (x0)
     localparam TAG_W  = `TAG_W,
     localparam W      = `SUPERSCALAR_WIDTH,
     localparam RAT_SZ = `ARCH_REG_SZ
@@ -33,12 +35,12 @@ module retire_rat #(
   always_comb begin
     map_next = map;
     for (int i = 0; i < W; i++)
-      if (commit_en[i] && commit_rd[i] != '0) map_next[commit_rd[i]] = commit_tag[i];
+      if (commit_en[i] && (!ZERO_REG || commit_rd[i] != '0)) map_next[commit_rd[i]] = commit_tag[i];
   end
 
   always_ff @(posedge clock) begin
     if (reset) begin
-      for (int i = 0; i < RAT_SZ; i++) map[i] <= TAG_W'(i);
+      for (int i = 0; i < RAT_SZ; i++) map[i] <= TAG_W'(BASE + i);
     end else begin
       map <= map_next;
     end

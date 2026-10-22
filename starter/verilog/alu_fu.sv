@@ -110,7 +110,7 @@ module alu_fu (
       out_valid <= in_valid;
       if (in_valid)
         out_pkt <= '{tag: in_pkt.dest_tag, value: alu_result, rob_idx: in_pkt.rob_idx,
-                     branch: `FALSE, next_pc: '0, exception: EXC_NONE};
+                     branch: `FALSE, next_pc: '0, exception: EXC_NONE, fflags: '0};
     end
     // else: holding a result that lost arbitration — keep it
   end

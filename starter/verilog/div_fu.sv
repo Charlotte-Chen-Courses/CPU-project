@@ -81,7 +81,7 @@ module div_fu (
           // left (ready), so a finished result never has to wait for the output register
           out_valid <= `TRUE;
           out_pkt   <= '{tag: tag, value: want_rem ? r_fix : q_fix, rob_idx: rob_idx,
-                         branch: `FALSE, next_pc: '0, exception: EXC_NONE};
+                         branch: `FALSE, next_pc: '0, exception: EXC_NONE, fflags: '0};
           busy      <= `FALSE;
         end
       end else if (in_valid && ready) begin   // never start over a result still waiting for the CDB

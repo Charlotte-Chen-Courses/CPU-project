@@ -159,6 +159,16 @@ module cpu #(
         ras_pop       = pred_ret[i];
         ras_push_addr = fetch_pc[i] + 4;
       end
+      // a CSR op or an atomic ends the bundle (serial: nothing younger may dispatch with it);
+      // fetch goes on at its pc + 4
+      if (fetch_valid[i] && ((fetch_inst[i][6:0] == 7'b1110011 && fetch_inst[i][14:12] != 3'b000) ||
+                             fetch_inst[i][6:0] == 7'b0101111)) begin
+        redirected     = `TRUE;
+        fetch_next_pc  = fetch_pc[i] + 4;
+        fetch_pred_npc[i] = fetch_pc[i] + 4;
+        ras_push       = `FALSE;
+        ras_pop        = `FALSE;
+      end
     end
   end
 
@@ -218,7 +228,13 @@ module cpu #(
   logic [CDB_SZ-1:0][`XLEN-1:0]     cdb_value, cdb_next_pc;
   logic [CDB_SZ-1:0]                cdb_branch;
   EXCEPTION [CDB_SZ-1:0]            cdb_exception;
-  logic [`ARCH_REG_SZ-1:0][TAG_W-1:0] retire_map, retire_map_next;
+  logic [CDB_SZ-1:0][4:0]           cdb_fflags;
+  logic [W-1:0]                     disp_dest_fp, commit_dest_fp;
+  logic [W-1:0][4:0]                commit_fflags;
+  logic [ROB_IDX_W-1:0]             rob_head;
+  logic                             rob_empty;
+  logic [`ARCH_REG_SZ-1:0][TAG_W-1:0] retire_map, retire_map_next;         // x registers
+  logic [`ARCH_REG_SZ-1:0][TAG_W-1:0] fp_retire_map, fp_retire_map_next;   // f registers
 
   logic [W-1:0]                commit_halt;
   logic [W-1:0][TAG_W-1:0]     commit_told;
@@ -231,6 +247,7 @@ module cpu #(
       cdb_branch[k]  = cdb_pkt[k].branch;
       cdb_next_pc[k] = cdb_pkt[k].next_pc;
       cdb_exception[k] = cdb_pkt[k].exception;
+      cdb_fflags[k]    = cdb_pkt[k].fflags;
     end
 
   dispatch dispatch_0 (
@@ -243,6 +260,7 @@ module cpu #(
       .in_pred_npc    (fetch_pred_npc),
       .fire           (fire),
       .rob_space_ok   (rob_space_ok),
+      .rob_empty      (rob_empty),
       .rs_space_ok    (rs_space_ok),
       .lq_space_ok    (lq_space_ok),
       .sq_space_ok    (sq_space_ok),
@@ -263,14 +281,17 @@ module cpu #(
       .disp_is_ret    (disp_is_ret),
       .disp_is_load   (disp_is_load),
       .disp_is_store  (disp_is_store),
+      .disp_dest_fp   (disp_dest_fp),
       .rs_disp_valid  (rs_disp_valid),
       .disp_pkt       (disp_pkt),
       .cdb_valid      (cdb_valid),
       .cdb_tag        (cdb_tag),
       .free_en        (commit_valid & commit_dest_valid),
+      .free_fp        (commit_dest_fp),
       .free_tag       (commit_told),
       .flush          (flush),
-      .recover_map    (retire_map_next)
+      .recover_map    (retire_map_next),
+      .fp_recover_map (fp_retire_map_next)
   );
 
   always_ff @(posedge clock) begin
@@ -307,6 +328,7 @@ module cpu #(
       .disp_is_ret      (disp_is_ret),
       .disp_is_load     (disp_is_load),
       .disp_is_store    (disp_is_store),
+      .disp_dest_fp     (disp_dest_fp),
       .replay_valid     (viol_valid),
       .replay_rob_idx   (viol_rob_idx),
       .disp_idx         (rob_disp_idx),
@@ -316,6 +338,7 @@ module cpu #(
       .cdb_branch       (cdb_branch),
       .cdb_next_pc      (cdb_next_pc),
       .cdb_exception    (cdb_exception),
+      .cdb_fflags       (cdb_fflags),
       .commit_stop      (halted),         // younger entries behind an exception never commit
       .commit_valid     (commit_valid),
       .commit_dest_valid(commit_dest_valid),
@@ -334,18 +357,32 @@ module cpu #(
       .commit_exception (commit_exception),
       .flush            (flush),
       .redirect_pc      (redirect_pc),
-      .replay_flush     (replay_flush)
+      .replay_flush     (replay_flush),
+      .commit_dest_fp   (commit_dest_fp),
+      .commit_fflags    (commit_fflags),
+      .head             (rob_head),
+      .empty            (rob_empty)
   );
 
 
   retire_rat retire_rat_0 (
       .clock     (clock),
       .reset     (reset),
-      .commit_en (commit_valid & commit_dest_valid),
+      .commit_en (commit_valid & commit_dest_valid & ~commit_dest_fp),
       .commit_rd (commit_rd),
       .commit_tag(commit_tag),
       .map       (retire_map),           // architectural xN = PRF[retire_map[N]]
       .map_next  (retire_map_next)       // after this cycle's commits: for recovery
+  );
+
+  retire_rat #(.BASE(`FP_TAG_BASE), .ZERO_REG(1'b0)) fp_retire_rat_0 (
+      .clock     (clock),
+      .reset     (reset),
+      .commit_en (commit_valid & commit_dest_valid & commit_dest_fp),
+      .commit_rd (commit_rd),
+      .commit_tag(commit_tag),
+      .map       (fp_retire_map),        // architectural fN = FP PRF[fp_retire_map[N]]
+      .map_next  (fp_retire_map_next)
   );
 
   always_ff @(posedge clock)
@@ -376,16 +413,25 @@ module cpu #(
       .cdb_valid  (cdb_valid),
       .cdb_tag    (cdb_tag),
       .flush      (flush),
+      .rob_head   (rob_head),
       .fu_ready   (fu_ready),
       .issue_valid(issue_valid),
       .issue_pkt  (issue_pkt)
   );
 
   // ---------------- PRF read: pack issued ports onto the ISSUE_W read-port pairs ----------------
+  // Both register files see every read port and every CDB write; a tag belongs to exactly one
+  // of them (FP tags start at FP_TAG_BASE). The FP file has one more read port: rs3 of the FP
+  // unit (fused multiply-add). Simple, but it gives the FP file as many read ports as the
+  // integer one (a Phase 6 area / timing item).
+  localparam FP_PORT = `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV + `NUM_FU_LOAD + `NUM_FU_STORE;
   logic [2*ISSUE_W-1:0][TAG_W-1:0]   prf_rd_tag;
-  logic [2*ISSUE_W-1:0][`XLEN-1:0]   prf_rd_data;
+  logic [2*ISSUE_W-1:0][`XLEN-1:0]   prf_rd_data, int_rd_data;
+  logic [2*ISSUE_W:0][TAG_W-1:0]     fp_rd_tag;
+  logic [2*ISSUE_W:0][`XLEN-1:0]     fp_rd_data;
   logic [NUM_FU-1:0][$clog2(ISSUE_W+1)-1:0] port_slot;
   logic [NUM_FU-1:0][`XLEN-1:0]      rs1_value, rs2_value;
+  logic [`XLEN-1:0]                  rs3_value;          // FP unit only
   int n_slot;
 
   always_comb begin
@@ -403,20 +449,55 @@ module cpu #(
 
   // (separate block: reading the PRF data back in the block that drives the tags
   //  would look like a combinational loop)
-  always_comb
+  always_comb begin
+    for (int r = 0; r < 2*ISSUE_W; r++)
+      prf_rd_data[r] = (int'(prf_rd_tag[r]) >= `FP_TAG_BASE) ? fp_rd_data[r] : int_rd_data[r];
     for (int f = 0; f < NUM_FU; f++) begin
       rs1_value[f] = prf_rd_data[2*port_slot[f]];
       rs2_value[f] = prf_rd_data[2*port_slot[f] + 1];
     end
+    rs3_value = fp_rd_data[2*ISSUE_W];
+  end
+
+  always_comb begin
+    fp_rd_tag[2*ISSUE_W-1:0] = prf_rd_tag;
+    fp_rd_tag[2*ISSUE_W]     = (`NUM_FU_FP > 0) ? issue_pkt[FP_PORT < NUM_FU ? FP_PORT : 0].src3_tag : '0;
+  end
 
   prf prf_0 (
       .clock  (clock),
       .rd_tag (prf_rd_tag),
-      .rd_data(prf_rd_data),
+      .rd_data(int_rd_data),
       .wr_en  (cdb_valid),
       .wr_tag (cdb_tag),
       .wr_data(cdb_value)
   );
+
+  prf #(.RD_SZ(2*ISSUE_W + 1), .BASE(`FP_TAG_BASE), .SZ(`FP_PHYS_REG_SZ), .ZERO_REG(1'b0)) fp_prf_0 (
+      .clock  (clock),
+      .rd_tag (fp_rd_tag),
+      .rd_data(fp_rd_data),
+      .wr_en  (cdb_valid),
+      .wr_tag (cdb_tag),
+      .wr_data(cdb_value)
+  );
+
+  // fcsr = {frm, fflags}. fflags accumulate the flags of instructions that commit without an
+  // exception (wrong-path flags never count); CSR ops on fflags/frm/fcsr write it from the FP
+  // unit when they issue (serial: nothing older is left, nothing younger exists yet).
+  logic [7:0] fcsr, fcsr_wdata;
+  logic       fcsr_we;
+  always_ff @(posedge clock) begin
+    automatic logic [4:0] acc = '0;
+    for (int i = 0; i < W; i++) acc |= commit_fflags[i];
+    if (reset)        fcsr <= '0;
+    else if (fcsr_we) fcsr <= fcsr_wdata;
+    else              fcsr[4:0] <= fcsr[4:0] | acc;
+  end
+  if (`NUM_FU_FP == 0) begin : gen_no_fcsr_write
+    assign fcsr_we    = `FALSE;
+    assign fcsr_wdata = '0;
+  end
 
   // ---------------- functional units ----------------
   genvar g;
@@ -482,6 +563,24 @@ module cpu #(
       );
     end else if (g == LD_PORT || g == ST_PORT) begin : gen_lsq
       // load / store ports belong to the LSQ (connected below)
+    end else if (g == FP_PORT) begin : gen_fp
+      fp_fu fp_fu_0 (
+          .clock    (clock),
+          .reset    (reset),
+          .in_valid (issue_valid[g]),
+          .in_pkt   (issue_pkt[g]),
+          .ready    (fu_ready[g]),
+          .out_valid(fu_out_valid[g]),
+          .out_pkt  (fu_out_pkt[g]),
+          .out_grant(fu_grant[g]),
+          .flush    (flush),
+          .rs1_value(rs1_value[g]),
+          .rs2_value(rs2_value[g]),
+          .rs3_value(rs3_value),
+          .fcsr     (fcsr),
+          .fcsr_we  (fcsr_we),
+          .fcsr_wdata(fcsr_wdata)
+      );
     end else begin : gen_none
       // FU type not implemented yet: never ready, never produces a result
       assign fu_ready[g]     = `FALSE;

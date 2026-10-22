@@ -1,0 +1,30 @@
+--- a/src/fpnew_divsqrt_th_32.sv
++++ b/src/fpnew_divsqrt_th_32.sv
+@@ -195,6 +195,9 @@
+             state_d = IDLE; // we anticipate going back to idling..
+             if (in_valid_q && unit_ready_q) begin // ..unless new work comes in
+               in_ready = 1'b1; // we acknowledge the instruction
++              // LOCAL PATCH (CPU-project): as in IDLE, a start that stalls in EX1 completes its
++              // handshake one cycle later (BUSY: ready = fdsu_fpu_ex1_stall_q)
++              inp_pipe_ready[NUM_INP_REGS] = unit_ready_q && !fdsu_fpu_ex1_stall;
+               state_d  = BUSY; // and stay busy with it
+             end
+           // Otherwise if downstream is not ready for the result
+@@ -206,6 +209,9 @@
+       end
+       // Waiting with valid result for downstream
+       HOLD: begin
++        // LOCAL PATCH (CPU-project): take no input unless an operation actually starts below (the
++        // default, unit_ready_q, completed handshakes for ops that never started)
++        inp_pipe_ready[NUM_INP_REGS] = 1'b0;
+         unit_busy    = 1'b1; // data in flight
+         data_is_held = 1'b1; // data in hold register is valid
+         out_valid    = 1'b1; // try to commit result downstream
+@@ -214,6 +220,7 @@
+           state_d = IDLE; // go back to idle..
+           if (in_valid_q && unit_ready_q) begin // ..unless new work comes in
+             in_ready = 1'b1; // acknowledge the new transaction
++            inp_pipe_ready[NUM_INP_REGS] = unit_ready_q && !fdsu_fpu_ex1_stall;   // LOCAL PATCH, as above
+             state_d  = BUSY; // will be busy with the next instruction
+           end
+         end

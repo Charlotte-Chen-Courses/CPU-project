@@ -79,7 +79,8 @@ module branch_fu (
       if (in_valid)
         out_pkt <= '{tag: in_pkt.dest_tag, value: link, rob_idx: in_pkt.rob_idx,
                      branch: `TRUE, next_pc: next_pc,
-                     exception: (next_pc[1:0] != 2'b00) ? EXC_MISALIGNED : EXC_NONE};   // no C extension
+                     exception: (next_pc[1:0] != 2'b00) ? EXC_MISALIGNED : EXC_NONE,   // no C extension
+                     fflags: '0};
     end
     // else: holding a result that lost arbitration — keep it
   end

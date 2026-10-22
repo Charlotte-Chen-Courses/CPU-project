@@ -86,6 +86,6 @@ module mult_fu (
   assign out_pkt = '{tag: meta[N-1].tag,
                      value: meta[N-1].high ? product[63:32] : product[31:0],
                      rob_idx: meta[N-1].rob_idx,
-                     branch: `FALSE, next_pc: '0, exception: EXC_NONE};
+                     branch: `FALSE, next_pc: '0, exception: EXC_NONE, fflags: '0};
 
 endmodule  // mult_fu

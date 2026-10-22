@@ -6,7 +6,7 @@
 //                 Dispatch: up to WIDTH packets into any free entries //
 //                 (first-free search; space_ok = room for a full      //
 //                 bundle, from state only). Wakeup: every CDB tag is  //
-//                 compared with both source tags of every valid       //
+//                 compared with the three source tags of every valid  //
 //                 entry; a packet dispatched while its source is on   //
 //                 the CDB arrives ready (same-cycle bypass).          //
 //                 Issue: per FU port, lowest-index ready entry of     //
@@ -14,6 +14,8 @@
 //                 total; FU types served longest latency first        //
 //                 (rank_type in sys_defs). fu_ready backpressures a   //
 //                 port. Issued entries free at the clock edge.        //
+//                 A serial entry (CSR, later atomics) is ready only   //
+//                 when it is the oldest instruction (rob_head).       //
 //                 Known: lowest-index select can starve high slots.   //
 //                 flush clears all.                                   //
 //                                                                     //
@@ -42,6 +44,7 @@ module rs #(
     input [CDB_SZ-1:0][TAG_W-1:0] cdb_tag,
 
     input flush,  // branch mispredict: squash every entry
+    input [`ROB_IDX_W-1:0] rob_head,  // oldest instruction: a serial entry issues only there
 
     // issue
     input [NUM_FU-1:0] fu_ready,
@@ -96,6 +99,7 @@ module rs #(
       if (cdb_valid[k]) begin
         if (disp_pkt[i].src1_tag == cdb_tag[k]) cdb_pkt[i].src1_ready = `TRUE;
         if (disp_pkt[i].src2_tag == cdb_tag[k]) cdb_pkt[i].src2_ready = `TRUE;
+        if (disp_pkt[i].src3_tag == cdb_tag[k]) cdb_pkt[i].src3_ready = `TRUE;
       end
     end
   end
@@ -103,7 +107,8 @@ module rs #(
   // issue search
   always_comb begin
     for (int e = 0; e < RS_SZ; e++)
-    ready[e] = rs_valid[e] && rs_map[e].src1_ready && rs_map[e].src2_ready;
+    ready[e] = rs_valid[e] && rs_map[e].src1_ready && rs_map[e].src2_ready && rs_map[e].src3_ready &&
+               (!rs_map[e].serial || rs_map[e].rob_idx == rob_head);
 
     granted     = '0;
     issue_valid = '0;
@@ -133,6 +138,7 @@ module rs #(
           if (cdb_valid[k]) begin
             if (rs_map[e].src1_tag == cdb_tag[k]) rs_map[e].src1_ready <= `TRUE;
             if (rs_map[e].src2_tag == cdb_tag[k]) rs_map[e].src2_ready <= `TRUE;
+            if (rs_map[e].src3_tag == cdb_tag[k]) rs_map[e].src3_ready <= `TRUE;
           end
       end
       for (int i = 0; i < W; i++)

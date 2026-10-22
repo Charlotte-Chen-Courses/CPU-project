@@ -9,6 +9,10 @@
 //                 or is preg 0. Directed tests cover reset contents,  //
 //                 drain-to-empty, FIFO order, same-cycle alloc+free,  //
 //                 and unpacked requests; then random traffic.         //
+//                 +define+FP_CLASS: the FP instance (tags offset by   //
+//                 FP_TAG_BASE through an adapter; preg 0, the initial //
+//                 f0, is an ordinary register that gets freed and     //
+//                 reused, and the core-like model renames f0 too).    //
 //                 Prints @@@ Passed/Failed.                           //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
@@ -18,23 +22,36 @@
 module testbench;
 
     localparam W     = `SUPERSCALAR_WIDTH;
-    localparam TAG_W = $clog2(`PHYS_REG_SZ);
-    localparam SZ    = `FREE_LIST_SZ;
+    localparam TAG_W = `TAG_W;
+`ifdef FP_CLASS
+    localparam BASE = `FP_TAG_BASE, NPHYS = `FP_PHYS_REG_SZ, SZ = `FP_FREE_LIST_SZ;
+    localparam ZR = 0;
+`else
+    localparam BASE = 0, NPHYS = `PHYS_REG_SZ, SZ = `FREE_LIST_SZ;
+    localparam ZR = 1;
+`endif
 
     logic                       clock, reset;
     logic [W-1:0]               alloc_req, free_en;
-    logic [W-1:0][TAG_W-1:0]    alloc_tag, free_tag;
+    logic [W-1:0][TAG_W-1:0]    alloc_tag, free_tag, d_alloc_tag, d_free_tag;
     logic                       alloc_ok, can_alloc_w;
     logic                       flush;
 
-    freelist dut (
+    // class-local tags here; the DUT sees them offset by BASE
+    always_comb
+        for (int i = 0; i < W; i++) begin
+            d_free_tag[i] = free_tag[i] + TAG_W'(BASE);
+            alloc_tag[i]  = d_alloc_tag[i] - TAG_W'(BASE);
+        end
+
+    freelist #(.BASE(BASE), .FL_SZ(SZ), .ZERO_REG(ZR == 1)) dut (
         .clock    (clock),
         .reset    (reset),
         .alloc_req(alloc_req),
-        .alloc_tag(alloc_tag),
+        .alloc_tag(d_alloc_tag),
         .alloc_ok (alloc_ok),
         .free_en  (free_en),
-        .free_tag (free_tag),
+        .free_tag (d_free_tag),
         .can_alloc_w(can_alloc_w),
         .flush    (flush)
     );
@@ -50,8 +67,8 @@ module testbench;
     task automatic model_reset();
         free_q.delete();
         held.delete();
-        for (int t = 32; t < `PHYS_REG_SZ; t++) free_q.push_back(t);
-        for (int t = 1; t < 32; t++) held.push_back(t);  // preg 0 is never freed
+        for (int t = 32; t < NPHYS; t++) free_q.push_back(t);
+        for (int t = ZR; t < 32; t++) held.push_back(t);  // x0's preg 0 is never freed (f0's is)
     endtask
 
     task automatic fail(input string msg);
@@ -83,7 +100,7 @@ module testbench;
                 if (int'(alloc_tag[i]) != free_q[k])
                     fail($sformatf("slot %0d got p%0d expected p%0d (req=%b)",
                                    i, alloc_tag[i], free_q[k], req));
-                if (alloc_tag[i] == 0) fail($sformatf("slot %0d got preg 0", i));
+                if (ZR && alloc_tag[i] == 0) fail($sformatf("slot %0d got preg 0", i));
                 got[i] = int'(alloc_tag[i]);
                 k++;
             end
@@ -119,14 +136,14 @@ module testbench;
         for (int r = 0; r < 32; r++) begin spec_map[r] = r; arch_map[r] = r; end
     endtask
 
-    // every physical register except p0 is in exactly one place: free list, in flight, or arch
+    // every physical register (except x0's p0) is in exactly one place: free list, in flight, or arch
     task automatic check_conservation(input string what);
-        int count [`PHYS_REG_SZ];
+        int count [NPHYS];
         foreach (count[t]) count[t] = 0;
         foreach (free_q[i]) count[free_q[i]]++;
         foreach (q[i]) count[q[i].tag]++;
-        for (int r = 1; r < 32; r++) count[arch_map[r]]++;
-        for (int t = 1; t < `PHYS_REG_SZ; t++)
+        for (int r = ZR; r < 32; r++) count[arch_map[r]]++;
+        for (int t = ZR; t < NPHYS; t++)
             if (count[t] != 1) fail($sformatf("[%s] p%0d counted %0d times", what, t, count[t]));
         if (int'(dut.free_count) != free_q.size())
             fail($sformatf("[%s] free_count=%0d, model %0d", what, dut.free_count, free_q.size()));
@@ -177,7 +194,7 @@ module testbench;
             if (exp_ok)
                 for (int i = 0; i < W; i++)
                     if (req[i]) begin
-                        automatic int rd = $urandom_range(1, 31);
+                        automatic int rd = $urandom_range(ZR, 31);
                         automatic int t = free_q.pop_front();
                         q.push_back('{tag: t, told: spec_map[rd], rd: rd});
                         spec_map[rd] = t;
@@ -219,7 +236,7 @@ module testbench;
         reset = 0;
 
         // 1) reset contents: hands out p32, p33, ... in order, one slot at a time
-        $display("Test 1: reset contents come out in order (p32..p%0d)", `PHYS_REG_SZ - 1);
+        $display("Test 1: reset contents come out in order (p32..p%0d)", NPHYS - 1);
         for (int n = 0; n < SZ; n++) begin
             step(W'(1), '0, none);
             if (got[0] != 32 + n) fail($sformatf("alloc #%0d got p%0d expected p%0d", n, got[0], 32 + n));
@@ -288,7 +305,7 @@ module testbench;
         end
         $display("  (%0d cycles hit an empty list)", n_refused);
 
-        if (free_q.size() + held.size() != `PHYS_REG_SZ - 1)
+        if (free_q.size() + held.size() != NPHYS - ZR)
             fail($sformatf("tag conservation: free=%0d held=%0d", free_q.size(), held.size()));
 
         // 7) flush, directed (core-like order)

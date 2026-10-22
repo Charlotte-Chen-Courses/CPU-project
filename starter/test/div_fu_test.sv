@@ -92,7 +92,7 @@ module testbench;
             end
             if (in_valid && ready) begin
                 q.push_back('{tag: in_pkt.dest_tag, value: model(in_pkt.alu_func, rs1_value, rs2_value),
-                              rob_idx: in_pkt.rob_idx, branch: 0, next_pc: '0, exception: EXC_NONE});
+                              rob_idx: in_pkt.rob_idx, branch: 0, next_pc: '0, exception: EXC_NONE, fflags: '0});
                 busy_left = LAT - 1;   // edges after the issue edge
             end
         end

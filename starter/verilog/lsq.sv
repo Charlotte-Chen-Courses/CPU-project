@@ -44,6 +44,18 @@
 //                 only by an issued entry with the same number, so a  //
 //                 response for a squashed load is dropped.            //
 //                                                                     //
+//                 Atomics (A: LR / SC / AMO) come on the store port   //
+//                 and are serial (issued as the oldest instruction,   //
+//                 nothing younger dispatched), so they need no LQ/SQ  //
+//                 entry and may write memory at once: check the       //
+//                 address (rs1; misaligned / out of range -> the      //
+//                 exception, memory untouched), wait for committed    //
+//                 stores to drain, read, compute, write, and return   //
+//                 the old value (SC: 0 = success, 1 = fail) on the    //
+//                 store port's CDB output. LR sets the reservation    //
+//                 (one word); an SC clears it, and so does any store  //
+//                 written to that word (store, SC or AMO).            //
+//                                                                     //
 //                 Memory interface (dcache.sv's CPU side): request    //
 //                 (valid/ready), response for loads only (valid, id,  //
 //                 the aligned 32-bit word holding the address), any   //
@@ -202,7 +214,7 @@ module lsq #(
   assign ld_size  = MEM_SIZE'(ld_in_pkt.inst[13:12]);
   assign st_size  = MEM_SIZE'(st_in_pkt.inst[13:12]);
   assign ld_ready = `TRUE;                          // the LQ entry already exists
-  assign st_ready = !st_out_valid || st_out_grant;  // completion register free
+  assign st_ready = (!st_out_valid || st_out_grant) && at_state == AT_IDLE;  // completion register free, no atomic
 
   // ---------------- per-load disambiguation ----------------
   logic [LQ_SZ-1:0]             lq_valid, can_mem, can_fwd;
@@ -222,7 +234,7 @@ module lsq #(
         if (k < int'(n_older)) begin
           s = sq[(int'(sq_head[SQP-1:0]) + k) % SQ_SZ];
           if (!s.addr_v) begin
-            if (!`LSQ_SPECULATE || e.wait_st) unknown = 1;                  // speculate: go ahead anyway
+            if (`LSQ_SPECULATE == 0 || e.wait_st) unknown = 1;              // speculate: go ahead anyway
           end
           else if (s.exc == EXC_NONE &&                                     // excepting stores never write
                    s.addr < e.addr + `XLEN'(nbytes(e.size)) &&
@@ -240,7 +252,37 @@ module lsq #(
     end
   end
 
-  // ---------------- memory request: oldest ready load, else drain the oldest committed store ----------------
+  // ---------------- atomics ----------------
+  typedef enum logic [2:0] {AT_IDLE, AT_DRAIN, AT_READ, AT_WAIT, AT_WRITE, AT_DONE} AT_STATE;
+  AT_STATE               at_state;
+  logic [`XLEN-1:0]      at_addr, at_src, at_wdata, at_result;
+  logic [4:0]            at_f5;
+  logic [`TAG_W-1:0]     at_tag;
+  logic [`ROB_IDX_W-1:0] at_rob;
+  logic [ID_W-1:0]       at_id;
+  EXCEPTION              at_exc;
+  logic                  resv_v;           // LR reservation
+  logic [`XLEN-1:2]      resv_word;
+  logic                  st_is_amo, at_start;
+
+  assign st_is_amo = (st_in_pkt.inst[6:0] == 7'b0101111);
+  assign at_start  = st_in_valid && st_ready && st_is_amo && !flush;
+
+  function automatic logic [`XLEN-1:0] amo_op(input logic [4:0] f5, input logic [`XLEN-1:0] m, input logic [`XLEN-1:0] r);
+    case (f5)
+      5'b00001: return r;                                                   // amoswap
+      5'b00000: return m + r;                                               // amoadd
+      5'b00100: return m ^ r;                                               // amoxor
+      5'b01100: return m & r;                                               // amoand
+      5'b01000: return m | r;                                               // amoor
+      5'b10000: return ($signed(m) < $signed(r)) ? m : r;                   // amomin
+      5'b10100: return ($signed(m) > $signed(r)) ? m : r;                   // amomax
+      5'b11000: return (m < r) ? m : r;                                     // amominu
+      default:  return (m > r) ? m : r;                                     // amomaxu
+    endcase
+  endfunction
+
+  // ---------------- memory request: atomic, else oldest ready load, else drain the oldest committed store ----------------
   logic             req_is_load;
   logic [LQP-1:0]   req_lq;
   always_comb begin
@@ -253,7 +295,15 @@ module lsq #(
     dmem_req_valid = req_is_load || stores_pending;
     dmem_req_store = !req_is_load;
     dmem_req_id    = next_id;
-    if (req_is_load) begin
+    if (at_state == AT_READ || at_state == AT_WRITE) begin
+      // (nothing else is in flight: the atomic is the oldest instruction and stores have drained)
+      req_is_load    = `FALSE;
+      dmem_req_valid = `TRUE;
+      dmem_req_store = (at_state == AT_WRITE);
+      dmem_req_addr  = at_addr;
+      dmem_req_size  = WORD;
+      dmem_req_data  = at_wdata;
+    end else if (req_is_load) begin
       dmem_req_addr = lq[req_lq].addr;
       dmem_req_size = lq[req_lq].size;
       dmem_req_data = '0;
@@ -298,7 +348,7 @@ module lsq #(
       automatic bit           fwded   = can_fwd[j] || e.fwd_v;
       automatic logic [SQP:0] fwd_off = (can_fwd[j] ? fwd_pos[j] : e.fwd_pos) - sq_head;
       automatic bit shadowed = fwded && (SQP+1)'(st_off) < fwd_off && fwd_off < n_older;
-      if (`LSQ_SPECULATE && st_in_valid && st_ready && !flush && addr_check(st_addr, st_size) == EXC_NONE &&
+      if (`LSQ_SPECULATE != 0 && st_in_valid && st_ready && !st_is_amo && !flush && addr_check(st_addr, st_size) == EXC_NONE &&
           lq_valid[j] && e.addr_v && e.exc == EXC_NONE && read_value && !shadowed &&
           (SQP+1)'(st_off) < n_older &&                                       // store is older than the load
           sa < e.addr + `XLEN'(nbytes(e.size)) && e.addr < sa + `XLEN'(sn)) begin // and overlaps it
@@ -322,9 +372,56 @@ module lsq #(
       next_id <= '0;
       ld_out_valid <= `FALSE;
       st_out_valid <= `FALSE;
+      at_state     <= AT_IDLE;
+      resv_v       <= `FALSE;
     end else begin
+      // ---- atomic engine ----
+      case (at_state)
+        AT_IDLE: if (at_start) begin
+          at_exc   <= addr_check(st_rs1, WORD);
+          at_addr  <= st_rs1;
+          at_src   <= st_rs2;
+          at_f5    <= st_in_pkt.inst[31:27];
+          at_tag   <= st_in_pkt.dest_tag;
+          at_rob   <= st_in_pkt.rob_idx;
+          at_result <= '0;
+          at_state <= (addr_check(st_rs1, WORD) != EXC_NONE) ? AT_DONE : AT_DRAIN;
+        end
+        AT_DRAIN: if (!stores_pending) begin
+          if (at_f5 == 5'b00011) begin                             // sc.w
+            resv_v <= `FALSE;
+            if (resv_v && resv_word == at_addr[`XLEN-1:2]) begin
+              at_wdata <= at_src; at_result <= '0; at_state <= AT_WRITE;
+            end else begin
+              at_result <= 1; at_state <= AT_DONE;
+            end
+          end else at_state <= AT_READ;                              // lr.w, AMOs
+        end
+        AT_READ: if (dmem_req_ready) begin
+          at_id    <= next_id;
+          next_id  <= next_id + 1'b1;
+          at_state <= AT_WAIT;
+        end
+        AT_WAIT: if (dmem_resp_valid && dmem_resp_id == at_id) begin
+          at_result <= dmem_resp_data;
+          if (at_f5 == 5'b00010) begin                             // lr.w
+            resv_v    <= `TRUE;
+            resv_word <= at_addr[`XLEN-1:2];
+            at_state  <= AT_DONE;
+          end else begin
+            at_wdata <= amo_op(at_f5, dmem_resp_data, at_src);
+            at_state <= AT_WRITE;
+          end
+        end
+        AT_WRITE: if (dmem_req_ready) at_state <= AT_DONE;
+        default: if (!st_out_valid || st_out_grant) at_state <= AT_IDLE;   // AT_DONE: result goes out below
+      endcase
+      // reservation: any store written to the reserved word clears it (after an LR sets it above)
+      if (dmem_req_valid && dmem_req_ready && dmem_req_store && dmem_req_addr[`XLEN-1:2] == resv_word)
+        resv_v <= `FALSE;
+
       // memory request accepted
-      if (dmem_req_valid && dmem_req_ready) begin
+      if (dmem_req_valid && dmem_req_ready && at_state != AT_READ && at_state != AT_WRITE) begin
         if (req_is_load) begin
           lq[req_lq].issued <= `TRUE;
           lq[req_lq].req_id <= next_id;
@@ -356,12 +453,17 @@ module lsq #(
       if ((!ld_out_valid || ld_out_grant) && out_pick_v) begin
         ld_out_valid <= `TRUE;
         ld_out_pkt   <= '{tag: lq[out_pick].tag, value: lq[out_pick].value, rob_idx: lq[out_pick].rob_idx,
-                          branch: `FALSE, next_pc: '0, exception: lq[out_pick].exc};
+                          branch: `FALSE, next_pc: '0, exception: lq[out_pick].exc, fflags: '0};
         lq[out_pick].bcast <= `TRUE;
       end
 
-      // store completion register
+      // store completion register (also carries an atomic's result)
       if (st_out_valid && st_out_grant) st_out_valid <= `FALSE;
+      if (at_state == AT_DONE && (!st_out_valid || st_out_grant)) begin
+        st_out_valid <= `TRUE;
+        st_out_pkt   <= '{tag: at_tag, value: at_result, rob_idx: at_rob,
+                          branch: `FALSE, next_pc: '0, exception: at_exc, fflags: '0};
+      end
 
       if (!flush) begin
         // load address generation
@@ -379,13 +481,13 @@ module lsq #(
           if (x != EXC_NONE) begin lq[j].done <= `TRUE; lq[j].value <= '0; end
         end
         // store address + data
-        if (st_in_valid && st_ready) begin
+        if (st_in_valid && st_ready && !st_is_amo) begin
           automatic logic [SQP-1:0] k = SQP'(st_in_pkt.lsq_idx);
           automatic EXCEPTION       x = addr_check(st_addr, st_size);
           sq[k] <= '{addr_v: `TRUE, addr: st_addr, size: st_size, data: st_rs2, exc: x};
           st_out_valid <= `TRUE;
           st_out_pkt   <= '{tag: st_in_pkt.dest_tag, value: '0, rob_idx: st_in_pkt.rob_idx,
-                            branch: `FALSE, next_pc: '0, exception: x};
+                            branch: `FALSE, next_pc: '0, exception: x, fflags: '0};
         end
         // allocation (dispatch is blocked in a flush cycle anyway)
         for (int i = 0; i < W; i++) begin

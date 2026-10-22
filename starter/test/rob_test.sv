@@ -11,7 +11,10 @@
 //                 head-blocking, unpacked dispatch, no-dest commits,  //
 //                 and stale done bits in empty entries, and load      //
 //                 replay (a marked entry flushes at the head and      //
-//                 re-fetches its own PC); then random traffic with    //
+//                 re-fetches its own PC); every cycle also checks     //
+//                 head/empty and each commit's dest class and fflags  //
+//                 (0 unless it commits without an exception); then    //
+//                 random traffic with                                 //
 //                 wrap-around. Prints @@@ Passed/Failed.              //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
@@ -39,6 +42,11 @@ module testbench;
     logic [W-1:0]            disp_is_br, disp_uncond, commit_is_br, commit_uncond;
     logic [W-1:0]            disp_is_call, disp_is_ret, commit_is_call, commit_is_ret;
     logic [W-1:0]            disp_is_load, disp_is_store, commit_is_load, commit_is_store;
+    logic [W-1:0]            disp_dest_fp, commit_dest_fp;
+    logic [C-1:0][4:0]       cdb_fflags;
+    logic [W-1:0][4:0]       commit_fflags;
+    logic [PTR_W-1:0]        head;
+    logic                    empty;
     logic [W-1:0][`XLEN-1:0] commit_next_pc;
     logic [C-1:0][`XLEN-1:0] cdb_next_pc;
     logic                    flush, replay_valid, replay_flush;
@@ -70,6 +78,7 @@ module testbench;
         .disp_is_ret      (disp_is_ret),
         .disp_is_load     (disp_is_load),
         .disp_is_store    (disp_is_store),
+        .disp_dest_fp     (disp_dest_fp),
         .replay_valid     (replay_valid),
         .replay_rob_idx   (replay_rob_idx),
         .disp_idx         (disp_idx),
@@ -79,6 +88,7 @@ module testbench;
         .cdb_branch       (cdb_branch),
         .cdb_next_pc      (cdb_next_pc),
         .cdb_exception    (cdb_exception),
+        .cdb_fflags       (cdb_fflags),
         .commit_valid     (commit_valid),
         .commit_dest_valid(commit_dest_valid),
         .commit_rd        (commit_rd),
@@ -97,7 +107,11 @@ module testbench;
         .commit_stop      (1'b0),
         .flush            (flush),
         .redirect_pc      (redirect_pc),
-        .replay_flush     (replay_flush)
+        .replay_flush     (replay_flush),
+        .commit_dest_fp   (commit_dest_fp),
+        .commit_fflags    (commit_fflags),
+        .head             (head),
+        .empty            (empty)
     );
 
     always #5 clock = ~clock;
@@ -114,6 +128,8 @@ module testbench;
         EXCEPTION   exc;
         bit         is_br, uncond, is_call, is_ret, is_load, is_store;
         bit         replay;
+        bit         dest_fp;
+        logic [4:0] fflags;
     } entry_t;
 
     entry_t m [SZ];
@@ -138,6 +154,7 @@ module testbench;
         disp_is_br = '0; disp_uncond = '0; disp_is_call = '0; disp_is_ret = '0;
         disp_is_load = '0; disp_is_store = '0;
         replay_valid = 0; replay_rob_idx = '0;
+        disp_dest_fp = '0; cdb_fflags = '0;
     endtask
 
     // set dispatch slot i with random contents
@@ -156,6 +173,7 @@ module testbench;
         disp_is_ret[i]     = disp_uncond[i] && !disp_is_call[i] && ($urandom % 2 == 1);
         disp_is_load[i]    = !disp_is_br[i] && ($urandom % 4 == 0);
         disp_is_store[i]   = !disp_is_br[i] && !disp_is_load[i] && ($urandom % 3 == 0);
+        disp_dest_fp[i]    = dv && ($urandom % 3 == 0);
     endtask
 
     // ROB index of the k-th oldest in-flight entry
@@ -170,6 +188,8 @@ module testbench;
         bit exp_flush, exp_replay;
         logic [`XLEN-1:0] exp_redirect;
         #1;
+        if (head !== PTR_W'(m_head) || empty !== (m_count == 0))
+            fail($sformatf("[%s] head=%0d empty=%b, expected %0d %b", what, head, empty, m_head, m_count == 0));
         if (space_ok !== (m_count <= SZ - W))
             fail($sformatf("[%s] space_ok=%b with %0d entries", what, space_ok, m_count));
         if (disp_valid != 0 && m_count > SZ - W)
@@ -196,6 +216,8 @@ module testbench;
                 exp_flush = 1; exp_replay = 1; exp_redirect = m[nth(i)].pc;
             end
             exp = (n_com == i) && (i < m_count) && m[nth(i)].done && !halt_before && !exp_replay;
+            if (!exp && commit_fflags[i] !== 5'b0)
+                fail($sformatf("[%s] slot %0d commit_fflags=%b on a slot that does not commit", what, i, commit_fflags[i]));
             if (commit_valid[i] !== exp)
                 fail($sformatf("[%s] slot %0d commit_valid=%b expected %b (count=%0d)",
                                what, i, commit_valid[i], exp, m_count));
@@ -225,6 +247,11 @@ module testbench;
                                    commit_is_load[i], commit_is_store[i], m[idx].is_load, m[idx].is_store));
                 if (commit_pc[i] !== m[idx].pc)
                     fail($sformatf("[%s] slot %0d rob %0d: commit_pc=%h expected %h", what, i, idx, commit_pc[i], m[idx].pc));
+                if (commit_dest_fp[i] !== m[idx].dest_fp)
+                    fail($sformatf("[%s] slot %0d rob %0d: commit_dest_fp=%b expected %b", what, i, idx, commit_dest_fp[i], m[idx].dest_fp));
+                if (commit_fflags[i] !== ((m[idx].exc == EXC_NONE) ? m[idx].fflags : 5'b0))
+                    fail($sformatf("[%s] slot %0d rob %0d: commit_fflags=%b expected %b", what, i, idx, commit_fflags[i],
+                                   (m[idx].exc == EXC_NONE) ? m[idx].fflags : 5'b0));
                 if (commit_halt[i] !== m[idx].halt)
                     fail($sformatf("[%s] slot %0d rob %0d: commit_halt=%b expected %b", what, i, idx, commit_halt[i], m[idx].halt));
                 if (!exp_flush && m[idx].exc == EXC_NONE && m[idx].next_pc != m[idx].pred_npc) begin
@@ -249,6 +276,7 @@ module testbench;
                 m[cdb_rob_idx[k]].done = 1;
                 if (cdb_branch[k]) m[cdb_rob_idx[k]].next_pc = cdb_next_pc[k];
                 if (cdb_exception[k] != EXC_NONE) m[cdb_rob_idx[k]].exc = cdb_exception[k];
+                m[cdb_rob_idx[k]].fflags = cdb_fflags[k];
             end
         n_disp = 0;
         for (int i = 0; i < W; i++)
@@ -259,7 +287,8 @@ module testbench;
                            pred_npc: disp_pred_npc[i], next_pc: disp_pc[i] + 4, exc: disp_exception[i],
                            is_br: disp_is_br[i], uncond: disp_uncond[i],
                            is_call: disp_is_call[i], is_ret: disp_is_ret[i],
-                           is_load: disp_is_load[i], is_store: disp_is_store[i], replay: 0};
+                           is_load: disp_is_load[i], is_store: disp_is_store[i], replay: 0,
+                           dest_fp: disp_dest_fp[i], fflags: '0};
                 n_disp++;
             end
         m_head  = (m_head + n_com) % SZ;
@@ -513,6 +542,7 @@ module testbench;
                         cdb_exception[p] = ($urandom % 16 == 0) ? EXC_MISALIGNED : ($urandom % 32 == 0) ? EXC_ACCESS : EXC_NONE;
                     end
                     else complete(p, k);
+                    cdb_fflags[p] = 5'($urandom);
                 end
             step("random");
         end

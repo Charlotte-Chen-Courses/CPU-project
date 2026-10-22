@@ -15,7 +15,9 @@
 //                 LOAD > STORE > BRANCH > ALU, each taking min(#ready,//
 //                 #free ports, slots left). Directed                  //
 //                 tests cover wakeup timing, same-cycle dispatch+CDB  //
-//                 bypass, fu_ready backpressure, and fill/reuse; then //
+//                 bypass, fu_ready backpressure, fill/reuse, the      //
+//                 third source (FMA) and serial entries (ready only   //
+//                 at rob_head, which the test points around); then    //
 //                 random traffic and a final drain (every dispatched  //
 //                 instruction issues exactly once).                   //
 //                 Prints @@@ Passed/Failed.                           //
@@ -42,6 +44,7 @@ module testbench;
     logic [C-1:0]            cdb_valid;
     logic [C-1:0][TAG_W-1:0] cdb_tag;
     logic                    flush;
+    logic [ROB_W-1:0]        rob_head;
     logic [NFU-1:0]          fu_ready;
     logic [NFU-1:0]          issue_valid;
     RS_PACKET [NFU-1:0]      issue_pkt;
@@ -55,6 +58,7 @@ module testbench;
         .cdb_valid  (cdb_valid),
         .cdb_tag    (cdb_tag),
         .flush      (flush),
+        .rob_head   (rob_head),
         .fu_ready   (fu_ready),
         .issue_valid(issue_valid),
         .issue_pkt  (issue_pkt)
@@ -101,8 +105,16 @@ module testbench;
     endfunction
 
     function automatic bit is_ready(input RS_PACKET p);
-        return p.src1_ready && p.src2_ready;
+        return p.src1_ready && p.src2_ready && p.src3_ready && (!p.serial || p.rob_idx == rob_head);
     endfunction
+
+    // point rob_head at a waiting serial entry half the time (else anywhere)
+    task automatic aim_head();
+        int ser [$];
+        foreach (m[j]) if (m[j].pkt.serial) ser.push_back(j);
+        rob_head = (ser.size() > 0 && $urandom % 2 == 1) ? m[ser[$urandom_range(0, ser.size() - 1)]].pkt.rob_idx
+                                                          : ROB_W'($urandom);
+    endtask
 
     task automatic idle();
         disp_valid = '0; disp_pkt = '0;
@@ -126,7 +138,7 @@ module testbench;
     endfunction
 
     // build a packet; each source is ready (random tag) or waits on an outstanding tag
-    function automatic RS_PACKET make_pkt(input FU_TYPE t, input bit r1, input bit r2);
+    function automatic RS_PACKET make_pkt(input FU_TYPE t, input bit r1, input bit r2, input bit r3 = 1, input bit ser = 0);
         RS_PACKET p = '0;
         bit found, busy;
         // ids wrap, and a starved entry can outlive 2^11 dispatches: skip ids still in flight
@@ -145,6 +157,10 @@ module testbench;
         if (!r1 && !found) begin p.src1_tag = new_outstanding(); end
         p.src2_tag = r2 ? TAG_W'($urandom) : any_outstanding(found);
         if (!r2 && !found) begin p.src2_tag = new_outstanding(); end
+        p.src3_ready = r3;
+        p.src3_tag = r3 ? TAG_W'($urandom) : any_outstanding(found);
+        if (!r3 && !found) begin p.src3_tag = new_outstanding(); end
+        p.serial = ser;
         return p;
     endfunction
 
@@ -242,6 +258,7 @@ module testbench;
                 foreach (m[j]) begin
                     if (m[j].pkt.src1_tag == cdb_tag[k]) m[j].pkt.src1_ready = 1;
                     if (m[j].pkt.src2_tag == cdb_tag[k]) m[j].pkt.src2_ready = 1;
+                    if (m[j].pkt.src3_tag == cdb_tag[k]) m[j].pkt.src3_ready = 1;
                     if (m[j].ready_at < 0 && is_ready(m[j].pkt)) m[j].ready_at = cycle + 1;
                 end
                 outstanding[cdb_tag[k]] = 0;
@@ -254,6 +271,7 @@ module testbench;
                     if (cdb_valid[k]) begin
                         if (p.src1_tag == cdb_tag[k]) p.src1_ready = 1;
                         if (p.src2_tag == cdb_tag[k]) p.src2_ready = 1;
+                        if (p.src3_tag == cdb_tag[k]) p.src3_ready = 1;
                     end
                 m.push_back('{id: id_of(p), pkt: p, ready_at: is_ready(p) ? cycle + 1 : -1});
                 seen.delete(id_of(p));   // ids wrap: a reused id starts fresh
@@ -275,6 +293,7 @@ module testbench;
             end
             // restore: the model clears outstanding at the edge
             for (int k = 0; k < C; k++) if (cdb_valid[k]) outstanding[cdb_tag[k]] = 1;
+            aim_head();
             step(what);
             guard++;
         end
@@ -311,7 +330,7 @@ module testbench;
             if (!dup) served.push_back(port_type(f));
         end
 
-        clock = 0;
+        clock = 0; rob_head = '0;
         idle();
         reset = 1;
         @(negedge clock);
@@ -372,6 +391,20 @@ module testbench;
         step("reuse");
         drain("drain reuse");
 
+        $display("Test 6b: a serial entry waits for rob_head; src3 wakes like the others");
+        idle(); rob_head = '0;
+        p = make_pkt(FU_ALU, 1, 1, 1, 1); id = last_id(); disp(0, p);
+        if (p.rob_idx == '0) rob_head = 1;      // not its turn yet
+        step("dispatch serial");
+        for (int c = 0; c < 3; c++) begin idle(); rob_head = p.rob_idx + 1; step("serial, not at head"); end
+        idle(); rob_head = p.rob_idx; step("serial at head issues");
+        if (!seen.exists(id)) fail("serial entry did not issue at the head");
+        idle(); p = make_pkt(FU_ALU, 1, 1, 0); id = last_id(); t = p.src3_tag; disp(0, p);
+        step("dispatch waiting on src3");
+        idle(); broadcast(0, t); step("src3 broadcast");
+        idle(); step("src3 ready: issues");
+        if (!seen.exists(id)) fail("entry waiting on src3 did not issue after its broadcast");
+
         // 7) flush: a full RS empties; nothing it held ever issues; slots are reusable
         $display("Test 7: flush squashes every entry");
         for (int n = 0; space_ok && n < 4 * SZ; n++) begin
@@ -408,8 +441,9 @@ module testbench;
                 for (int i = 0; i < W; i++)
                     if ($urandom % 3 != 0)
                         disp(i, make_pkt(served[$urandom_range(0, served.size()-1)],
-                                         1'($urandom % 2), 1'($urandom % 2)));
+                                         1'($urandom % 2), 1'($urandom % 2), $urandom % 4 != 0, $urandom % 10 == 0));
             flush = ($urandom % 100 == 0);
+            aim_head();
             step("random");
         end
 

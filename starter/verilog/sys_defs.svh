@@ -31,9 +31,14 @@
 `define RS_SZ 16
 `define ARCH_REG_SZ 32
 `define ROB_SZ 32
-`define PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)
+`define PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)          // integer physical registers: tags 0..
 `define FREE_LIST_SZ (`PHYS_REG_SZ - `ARCH_REG_SZ)
-`define TAG_W $clog2(`PHYS_REG_SZ)
+// FP physical registers are a separate class with their own RAT/freelist/PRF/busy table; their
+// tags follow the integer ones (FP_TAG_BASE..), so one tag names a register of either class
+`define FP_PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)
+`define FP_FREE_LIST_SZ (`FP_PHYS_REG_SZ - `ARCH_REG_SZ)
+`define FP_TAG_BASE `PHYS_REG_SZ
+`define TAG_W $clog2(`PHYS_REG_SZ + `FP_PHYS_REG_SZ)
 `define ROB_IDX_W $clog2(`ROB_SZ)
 `define RS_IDX_W $clog2(`RS_SZ)
 
@@ -53,6 +58,8 @@
 //    later turns out to overlap replays it)
 // 2: speculate, except loads the load-wait table predicts will violate (they wait, as in 0)
 `define LSQ_SPECULATE 2
+// A extension (LR/SC/AMO, serialized, executed in the LSQ); 0: atomics stay unsupported
+`define A_EXTENSION 1
 // load-wait table (LSQ_SPECULATE = 2): one bit per entry, indexed by load PC, set when that load
 // is replayed; all bits clear every LWT_CLEAR cycles so stale predictions expire (Alpha 21264)
 `define LWT_SZ    64     // power of 2
@@ -90,7 +97,11 @@ typedef enum logic [2:0] {
 `define NUM_FU_DIV 1
 `define NUM_FU_LOAD 1    // the LSQ has exactly one load port and one store port
 `define NUM_FU_STORE 1
-`define NUM_FU_FP 0
+`define NUM_FU_FP 1     // 0 or 1 (one FP unit; the FP PRF has one rs3 read port)
+// FP unit (CVFPU) pipeline registers per operation group (FP32); fdiv/fsqrt are iterative
+`define FP_ADDMUL_REGS  3     // fadd/fsub/fmul/fmadd...: latency = regs + 1 (input buffer bypassed)
+`define FP_NONCOMP_REGS 1     // sgnj, min/max, compares, fclass, fmv
+`define FP_CONV_REGS    2     // fcvt
 `define NUM_FU (`NUM_FU_ALU+`NUM_FU_BRANCH+`NUM_FU_MULT+`NUM_FU_DIV+`NUM_FU_LOAD+`NUM_FU_STORE+`NUM_FU_FP)
 
 // Ports (RS issue ports = FU instances = CDB-arbiter inputs) are grouped by FU type in
@@ -460,6 +471,8 @@ typedef struct packed {
   logic              is_load;     // commit frees its LQ entry
   logic              is_store;    // commit lets its SQ entry drain to memory
   logic              replay;      // load that read memory too early: re-fetch it at commit
+  logic              dest_fp;     // rd is an f register (tag/told are FP pregs)
+  logic [4:0]        fflags;      // FP exception flags from the CDB
 } ROB_PACKET;
 
 
@@ -476,6 +489,9 @@ typedef struct packed {
   logic                  src1_ready;
   logic [`TAG_W-1:0]     src2_tag;
   logic                  src2_ready;
+  logic [`TAG_W-1:0]     src3_tag;     // FP fused multiply-add only (else ready)
+  logic                  src3_ready;
+  logic                  serial;       // issue only as the oldest instruction (ROB head)
   logic [`TAG_W-1:0]     dest_tag;
   logic [`ROB_IDX_W-1:0] rob_idx;
   FU_TYPE                fu_type;
@@ -501,6 +517,7 @@ typedef struct packed {
   logic [`XLEN-1:0]      next_pc;  // actual next PC (branches only)
   EXCEPTION              exception;  // raised by this instruction (misaligned target/address,
                                      // address out of range); the ROB records it
+  logic [4:0]            fflags;     // FP exception flags (NV DZ OF UF NX), into fcsr at commit
 } CDB_PACKET;
 
 

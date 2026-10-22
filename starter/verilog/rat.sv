@@ -12,6 +12,9 @@
 //                 renames as if done one slot at a time. On           //
 //                 rename_en, writes rd -> new_tag for each slot with  //
 //                 a real destination (valid, has_dest, rd != x0);     //
+//                 the FP instance (ZERO_REG = 0) renames f0 too, and  //
+//                 resets f_i to tag BASE + i. A third lookup (rs3)    //
+//                 serves fused multiply-add.                          //
 //                 the youngest slot wins on a same-rd conflict.       //
 //                 recover (mispredict) loads recover_map: the         //
 //                 retirement map including this cycle's commits.      //
@@ -21,6 +24,8 @@
 `include "verilog/sys_defs.svh"
 
 module rat #(
+    parameter  BASE  = 0,              // first tag of this register class: reset map[i] = BASE + i
+    parameter  bit ZERO_REG = 1'b1,    // register 0 is never renamed (x0)
     localparam TAG_W = `TAG_W,
     localparam W = `SUPERSCALAR_WIDTH,
     localparam RAT_SZ = `ARCH_REG_SZ
@@ -33,16 +38,19 @@ module rat #(
     input [W-1:0] valid,
     input [W-1:0][4:0] rs1,
     rs2,
+    rs3,
     rd,
     input [W-1:0] has_dest,
     input [W-1:0][TAG_W-1:0] new_tag,
     output logic [W-1:0][TAG_W-1:0] src1_tag,
     src2_tag,
+    src3_tag,
     told,
     // source tag came from an older slot in this bundle (that value is not produced
     // yet, so the source must start NOT ready even though the busy bit is still clear)
     output logic [W-1:0] src1_bypassed,
     src2_bypassed,
+    src3_bypassed,
     // mispredict: restore the committed mapping (including this cycle's commits)
     input recover,
     input [RAT_SZ-1:0][TAG_W-1:0] recover_map
@@ -52,19 +60,22 @@ module rat #(
   logic [RAT_SZ-1:0][TAG_W-1:0] map;
   logic [W-1:0] dest_valid;
 
-  always_comb for (int i = 0; i < W; i++) dest_valid[i] = valid[i] && has_dest[i] && (rd[i] != 0);
+  always_comb for (int i = 0; i < W; i++) dest_valid[i] = valid[i] && has_dest[i] && (!ZERO_REG || rd[i] != 0);
 
 
   always_comb begin
     for (int i = 0; i < W; i++) begin
       src1_tag[i] = map[rs1[i]];
       src2_tag[i] = map[rs2[i]];
+      src3_tag[i] = map[rs3[i]];
       told[i]     = map[rd[i]];
       src1_bypassed[i] = `FALSE;
       src2_bypassed[i] = `FALSE;
+      src3_bypassed[i] = `FALSE;
       for (int j = 0; j < i; j++) begin
         if (dest_valid[j] && rd[j] == rs1[i]) begin src1_tag[i] = new_tag[j]; src1_bypassed[i] = `TRUE; end
         if (dest_valid[j] && rd[j] == rs2[i]) begin src2_tag[i] = new_tag[j]; src2_bypassed[i] = `TRUE; end
+        if (dest_valid[j] && rd[j] == rs3[i]) begin src3_tag[i] = new_tag[j]; src3_bypassed[i] = `TRUE; end
         if (dest_valid[j] && rd[j] == rd[i]) told[i] = new_tag[j];
       end
     end
@@ -72,7 +83,7 @@ module rat #(
 
   always_ff @(posedge clock) begin
     if (reset) begin
-      for (int i = 0; i < RAT_SZ; i++) map[i] <= TAG_W'(i);
+      for (int i = 0; i < RAT_SZ; i++) map[i] <= TAG_W'(BASE + i);
     end else if (recover) begin
       map <= recover_map;
     end else if (rename_en) begin

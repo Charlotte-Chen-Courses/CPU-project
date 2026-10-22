@@ -72,12 +72,24 @@ immediately, even while tested at N=1.
   functional unit that makes out-of-order execution interesting (exercises
   wakeup/select and CDB arbitration). Use the provided pipelined multiplier.
 - **F (single-precision FP), one FP functional unit:**
-  - Rename a second register class: FP RAT (f0–f31; note f0 is a real register,
-    unlike x0) + FP freelist + FP PRF, or a unified PRF with a register-class
-    bit. **Decide which before Phase 4 starts** and record it here.
+  - Rename a second register class. **Decided 2026-10-21: separate FP
+    structures.** FP RAT (f0–f31; note f0 is a real register, unlike x0) + FP
+    freelist + FP PRF + FP busy table + FP retirement RAT, as second instances
+    of the existing int modules. CDB packets, RS source tags and ROB entries
+    carry a register-class bit. Why: it reuses tested modules unchanged, and
+    int vs FP register pressure stay separate axes for the analysis. Rejected:
+    a unified PRF with a class bit, which threads the class through the
+    freelist, busy table, every tag compare and recovery.
   - One FP FU: pipelined for add/sub/mul/fused multiply-add/convert/compare;
     fdiv/fsqrt may be iterative (unpipelined) inside the same unit. FP results
     share the same CDBs as integer results (CDB constraint below still holds).
+    **Decided 2026-10-21: import CVFPU (openhwgroup/cvfpu, formerly
+    pulp-platform/fpnew) for the arithmetic**, wrapped as our FU (issue/CDB
+    handshake, fflags out). Why: it saves the FPU arithmetic work for the
+    OoO integration. Own work to defend: the wrapper, rename and recovery,
+    fcsr, and the measurements. Verified against Spike's SoftFloat
+    (libsoftfloat.so ships with the Homebrew Spike) via DPI-C. Known cost:
+    an iterative fdiv/fsqrt blocks the whole FP port; measure it.
   - flw/fsw go through the LSQ like integer loads/stores.
   - fcsr: support rounding mode + accumulate fflags at commit. No FP traps.
   - **D (double) is still excluded.**
@@ -87,7 +99,13 @@ immediately, even while tested at N=1.
   amomax[u]). Execute non-speculatively at the head of the LSQ/ROB; LR sets a
   reservation that a conflicting store or SC clears. Single-thread it is mostly
   a correctness feature; with SMT it gets a real target (two threads sharing
-  L1).
+  L1). **Implemented 2026-10-21:** atomics are serial (fetch ends the bundle,
+  dispatch blocks until commit, issue only at the ROB head), so aq/rl are
+  trivially satisfied and the LSQ's atomic engine writes memory at execute.
+  Reservation rule (decided): cleared by any SC and by any store written to the
+  reserved word (store, SC or AMO). Spike clears it only on SC, so Spike
+  comparisons must avoid same-word stores between LR and SC.
+  `A_EXTENSION 0` makes atomics unsupported (the cut-order fallback).
 - **Excluded, by deliberate scoping judgment** (being able to articulate WHY is
   itself an interview signal):
   - **D (double-precision FP):** doubles FP datapath width for no new OoO
@@ -157,8 +175,8 @@ pre-planned fallback points so the project can never end with nothing.
 ### Phase 4 — F + A extensions (Weeks 7–8)
 - Only start if Phase 3 is genuinely stable.
 - Week 7 — F: decode FP ops (extend the P3 decoder, don't rewrite it); FP
-  register class through rename (FP RAT/freelist/PRF or unified PRF — decision
-  recorded in ISA scope); one FP FU on the shared CDBs; flw/fsw through the LSQ;
+  register class through rename (separate FP RAT/freelist/PRF — decision
+  recorded in ISA scope); one FP FU (CVFPU, wrapped) on the shared CDBs; flw/fsw through the LSQ;
   fcsr rounding mode + fflags at commit. Hand-written FP tests + golden check
   against Spike.
 - Week 8 — A: LR/SC + AMOs executed non-speculatively at the LSQ/ROB head;

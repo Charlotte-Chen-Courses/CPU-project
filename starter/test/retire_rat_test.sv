@@ -8,7 +8,10 @@
 //                 compared. Covers reset, one                         //
 //                 commit, both slots committing the same rd (younger  //
 //                 wins), rd = x0 never remapped, and random commits   //
-//                 on x0..x7. Prints @@@ Passed/Failed.                //
+//                 on x0..x7. +define+FP_CLASS: the FP instance (tags  //
+//                 offset by FP_TAG_BASE through an adapter; f0 is     //
+//                 remapped like any register). Prints @@@ Passed/     //
+//                 Failed.                                             //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -19,21 +22,34 @@ module testbench;
     localparam W     = `SUPERSCALAR_WIDTH;
     localparam TAG_W = `TAG_W;
     localparam NARCH = `ARCH_REG_SZ;
+`ifdef FP_CLASS
+    localparam BASE = `FP_TAG_BASE, NPHYS = `FP_PHYS_REG_SZ;
+    localparam bit ZR = 1'b0;
+`else
+    localparam BASE = 0, NPHYS = `PHYS_REG_SZ;
+    localparam bit ZR = 1'b1;
+`endif
 
     logic                          clock, reset;
     logic [W-1:0]                  commit_en;
     logic [W-1:0][4:0]             commit_rd;
-    logic [W-1:0][TAG_W-1:0]       commit_tag;
-    logic [NARCH-1:0][TAG_W-1:0]   map, map_next;
+    logic [W-1:0][TAG_W-1:0]       commit_tag, d_commit_tag;
+    logic [NARCH-1:0][TAG_W-1:0]   map, map_next, d_map, d_map_next;
 
-    retire_rat dut (
+    // class-local tags here; the DUT sees them offset by BASE
+    always_comb begin
+        for (int i = 0; i < W; i++) d_commit_tag[i] = commit_tag[i] + TAG_W'(BASE);
+        for (int r = 0; r < NARCH; r++) begin map[r] = d_map[r] - TAG_W'(BASE); map_next[r] = d_map_next[r] - TAG_W'(BASE); end
+    end
+
+    retire_rat #(.BASE(BASE), .ZERO_REG(ZR)) dut (
         .clock     (clock),
         .reset     (reset),
         .commit_en (commit_en),
         .commit_rd (commit_rd),
-        .commit_tag(commit_tag),
-        .map       (map),
-        .map_next  (map_next)
+        .commit_tag(d_commit_tag),
+        .map       (d_map),
+        .map_next  (d_map_next)
     );
 
     always #5 clock = ~clock;
@@ -51,7 +67,7 @@ module testbench;
         begin
             automatic int nxt [NARCH] = model;
             for (int i = 0; i < W; i++)
-                if (commit_en[i] && commit_rd[i] != 0) nxt[commit_rd[i]] = int'(commit_tag[i]);
+                if (commit_en[i] && (!ZR || commit_rd[i] != 0)) nxt[commit_rd[i]] = int'(commit_tag[i]);
             for (int x = 0; x < NARCH; x++)
                 if (map_next[x] !== TAG_W'(nxt[x])) begin
                     errors++;
@@ -60,7 +76,7 @@ module testbench;
         end
         @(posedge clock);
         for (int i = 0; i < W; i++)
-            if (commit_en[i] && commit_rd[i] != 0) model[commit_rd[i]] = int'(commit_tag[i]);
+            if (commit_en[i] && (!ZR || commit_rd[i] != 0)) model[commit_rd[i]] = int'(commit_tag[i]);
         @(negedge clock);
         for (int r = 0; r < NARCH; r++)
             if (map[r] !== TAG_W'(model[r])) begin
@@ -93,7 +109,8 @@ module testbench;
             step("same rd");
         end
 
-        $display("Test 4: rd = x0 is never remapped");
+        if (ZR) $display("Test 4: rd = x0 is never remapped");
+        else    $display("Test 4: rd = f0 is remapped");
         idle(); commit_en[0] = 1; commit_rd[0] = 0; commit_tag[0] = 43;
         step("x0");
 
@@ -103,7 +120,7 @@ module testbench;
             for (int i = 0; i < W; i++) begin
                 commit_en[i]  = ($urandom % 3 != 0);
                 commit_rd[i]  = 5'($urandom % 8);
-                commit_tag[i] = TAG_W'($urandom);
+                commit_tag[i] = TAG_W'($urandom % NPHYS);
             end
             step("random");
         end

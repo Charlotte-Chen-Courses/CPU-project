@@ -63,6 +63,7 @@ module rob #(
     input [W-1:0] disp_is_ret,  // RAS pop
     input [W-1:0] disp_is_load,
     input [W-1:0] disp_is_store,
+    input [W-1:0] disp_dest_fp,  // rd is an f register: tag/told are FP pregs
     // memory-order violation (from the LSQ): this load read memory before an older store
     input replay_valid,
     input [PTR_W-1:0] replay_rob_idx,
@@ -76,6 +77,7 @@ module rob #(
     input [CDB_SZ-1:0] cdb_branch,  // branch result: cdb_next_pc is the actual next PC
     input [CDB_SZ-1:0][`XLEN-1:0] cdb_next_pc,
     input EXCEPTION [CDB_SZ-1:0] cdb_exception,  // raised by the completing instruction
+    input [CDB_SZ-1:0][4:0] cdb_fflags,  // FP exception flags of the result
 
     // commit
     input commit_stop,  // the core has halted (WFI or exception committed): commit nothing more
@@ -98,7 +100,11 @@ module rob #(
     // recovery: a committing instruction whose actual next PC != predicted next PC
     output logic flush,  // squash everything younger (this cycle's edge)
     output logic [`XLEN-1:0] redirect_pc,  // where fetch restarts
-    output logic replay_flush  // this flush re-runs a load (statistics)
+    output logic replay_flush,  // this flush re-runs a load (statistics)
+    output logic [W-1:0] commit_dest_fp,  // the slot's tag/told are FP pregs
+    output logic [W-1:0][4:0] commit_fflags,  // flags to accumulate (0 unless it commits cleanly)
+    output logic [PTR_W-1:0] head,  // index of the oldest entry (serialized ops issue only there)
+    output logic empty
 );
   ROB_PACKET rob_map[ROB_SZ];
   logic [PTR_W-1:0] head_ptr, tail_ptr, commit_idx;
@@ -162,6 +168,8 @@ module rob #(
         redirect_pc = rob_map[commit_idx].pc;
         replay_flush = `TRUE;
       end
+      commit_dest_fp[i] = rob_map[commit_idx].dest_fp;
+      commit_fflags[i]  = (commit_valid[i] && rob_map[commit_idx].exception == EXC_NONE) ? rob_map[commit_idx].fflags : '0;
       halt_seen = halt_seen || commit_halt[i] || flush || commit_exception[i] != EXC_NONE;
       n_disp += int'(disp_valid[i]);
       n_commit += int'(commit_valid[i]);
@@ -169,6 +177,8 @@ module rob #(
   end
 
   assign space_ok = (int'(rob_count) <= ROB_SZ - W);
+  assign head     = head_ptr;
+  assign empty    = (rob_count == 0);
 
   // ---- sequential: next cycle's state ----
   always_ff @(posedge clock) begin
@@ -196,7 +206,9 @@ module rob #(
             is_ret: disp_is_ret[i],
             is_load: disp_is_load[i],
             is_store: disp_is_store[i],
-            replay: 1'b0
+            replay: 1'b0,
+            dest_fp: disp_dest_fp[i],
+            fflags: '0
         };
       head_ptr  <= PTR_W'((int'(head_ptr) + n_commit) % ROB_SZ);
       if (flush) begin
@@ -215,6 +227,7 @@ module rob #(
         rob_map[cdb_rob_idx[cdb_idx]].done <= `TRUE;
         if (cdb_branch[cdb_idx]) rob_map[cdb_rob_idx[cdb_idx]].next_pc <= cdb_next_pc[cdb_idx];
         if (cdb_exception[cdb_idx] != EXC_NONE) rob_map[cdb_rob_idx[cdb_idx]].exception <= cdb_exception[cdb_idx];
+        rob_map[cdb_rob_idx[cdb_idx]].fflags <= cdb_fflags[cdb_idx];
       end
     end
   end

@@ -77,7 +77,7 @@ module testbench;
             end
         endcase
         r = '{tag: p.dest_tag, value: link, rob_idx: p.rob_idx, branch: 1, next_pc: t ? tgt : link,
-              exception: (t && (tgt[1:0] != 2'b00)) ? EXC_MISALIGNED : EXC_NONE};
+              exception: (t && (tgt[1:0] != 2'b00)) ? EXC_MISALIGNED : EXC_NONE, fflags: '0};
         return r;
     endfunction
 

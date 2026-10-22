@@ -11,7 +11,12 @@
 //                 read, the same-cycle CDB bypass, p0, and multiple   //
 //                 sets/broadcasts per cycle; then random traffic that //
 //                 follows the core's rules (set tags are free, CDB    //
-//                 tags are busy). Prints @@@ Passed/Failed.           //
+//                 tags are busy). Also checks the third lookup (src3) //
+//                 and that tags of the other register class are       //
+//                 ignored (always ready, sets and broadcasts have no  //
+//                 effect). +define+FP_CLASS: the FP instance (tags    //
+//                 offset by FP_TAG_BASE through an adapter; preg 0 is //
+//                 an ordinary register). Prints @@@ Passed/Failed.    //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -22,7 +27,13 @@ module testbench;
     localparam W     = `SUPERSCALAR_WIDTH;
     localparam C     = `NUM_CDB;
     localparam TAG_W = `TAG_W;
-    localparam NTAG  = `PHYS_REG_SZ;
+`ifdef FP_CLASS
+    localparam BASE = `FP_TAG_BASE, NTAG = `FP_PHYS_REG_SZ, OTHER = 0;
+    localparam ZR = 0;
+`else
+    localparam BASE = 0, NTAG = `PHYS_REG_SZ, OTHER = `FP_TAG_BASE;
+    localparam ZR = 1;
+`endif
 
     logic                    clock, reset;
     logic [W-1:0]            set_en;
@@ -30,21 +41,38 @@ module testbench;
     logic [C-1:0]            cdb_valid;
     logic [C-1:0][TAG_W-1:0] cdb_tag;
     logic                    flush;
-    logic [W-1:0][TAG_W-1:0] src1_tag, src2_tag;
-    logic [W-1:0]            src1_ready, src2_ready;
+    logic [W-1:0][TAG_W-1:0] src1_tag, src2_tag, src3_tag;
+    logic [W-1:0]            src1_ready, src2_ready, src3_ready;
 
-    busy_table dut (
+    // class-local tags here; the DUT sees them offset by BASE (or by the other class's base)
+    bit other_class = 0;
+    logic [W-1:0][TAG_W-1:0] d_set_tag, d_src1_tag, d_src2_tag, d_src3_tag;
+    logic [C-1:0][TAG_W-1:0] d_cdb_tag;
+    always_comb begin
+        automatic logic [TAG_W-1:0] off = TAG_W'(other_class ? OTHER : BASE);
+        for (int i = 0; i < W; i++) begin
+            d_set_tag[i]  = set_tag[i]  + off;
+            d_src1_tag[i] = src1_tag[i] + off;
+            d_src2_tag[i] = src2_tag[i] + off;
+            d_src3_tag[i] = src3_tag[i] + off;
+        end
+        for (int k = 0; k < C; k++) d_cdb_tag[k] = cdb_tag[k] + off;
+    end
+
+    busy_table #(.BASE(BASE), .BUSY_TABLE_SZ(NTAG), .ZERO_REG(ZR == 1)) dut (
         .clock     (clock),
         .reset     (reset),
         .set_en    (set_en),
-        .set_tag   (set_tag),
+        .set_tag   (d_set_tag),
         .cdb_valid (cdb_valid),
-        .cdb_tag   (cdb_tag),
+        .cdb_tag   (d_cdb_tag),
         .flush     (flush),
-        .src1_tag  (src1_tag),
-        .src2_tag  (src2_tag),
+        .src1_tag  (d_src1_tag),
+        .src2_tag  (d_src2_tag),
+        .src3_tag  (d_src3_tag),
         .src1_ready(src1_ready),
-        .src2_ready(src2_ready)
+        .src2_ready(src2_ready),
+        .src3_ready(src3_ready)
     );
 
     always #5 clock = ~clock;
@@ -61,10 +89,11 @@ module testbench;
     task automatic idle();
         set_en = '0; set_tag = '0;
         cdb_valid = '0; cdb_tag = '0; flush = 0;
-        src1_tag = '0; src2_tag = '0;
+        src1_tag = '0; src2_tag = '0; src3_tag = '0;
     endtask
 
     function automatic bit exp_ready(input logic [TAG_W-1:0] t);
+        if (other_class) return 1;              // another class's tag: never busy here
         if (!busy[t]) return 1;
         for (int k = 0; k < C; k++) if (cdb_valid[k] && cdb_tag[k] == t) return 1;
         return 0;
@@ -80,12 +109,16 @@ module testbench;
             if (src2_ready[i] !== exp_ready(src2_tag[i]))
                 fail($sformatf("[%s] slot %0d src2 p%0d: ready=%b expected %b",
                                what, i, src2_tag[i], src2_ready[i], exp_ready(src2_tag[i])));
+            if (src3_ready[i] !== exp_ready(src3_tag[i]))
+                fail($sformatf("[%s] slot %0d src3 p%0d: ready=%b expected %b",
+                               what, i, src3_tag[i], src3_ready[i], exp_ready(src3_tag[i])));
         end
         @(posedge clock);
         if (flush) for (int t = 0; t < NTAG; t++) busy[t] = 0;   // flush clears everything
-        else
+        else if (!other_class)
         for (int k = 0; k < C; k++) if (cdb_valid[k]) busy[cdb_tag[k]] = 0;
-        if (!flush) for (int i = 0; i < W; i++) if (set_en[i] && set_tag[i] != 0) busy[set_tag[i]] = 1;
+        if (!flush && !other_class)
+            for (int i = 0; i < W; i++) if (set_en[i] && (!ZR || set_tag[i] != 0)) busy[set_tag[i]] = 1;
         @(negedge clock);
     endtask
 
@@ -96,6 +129,7 @@ module testbench;
             for (int i = 0; i < W; i++) begin
                 src1_tag[i] = TAG_W'((t + i) % NTAG);
                 src2_tag[i] = TAG_W'((t + i + 1) % NTAG);
+                src3_tag[i] = TAG_W'((t + i + 2) % NTAG);
             end
             step(what);
         end
@@ -104,7 +138,7 @@ module testbench;
     // a random tag that is (busy==want) and not p0, avoiding `avoid`; -1 if none
     function automatic int pick(input bit want, input int avoid [$]);
         int pool [$];
-        for (int t = 1; t < NTAG; t++)
+        for (int t = ZR; t < NTAG; t++)
             if (busy[t] == want && !(t inside {avoid})) pool.push_back(t);
         return pool.size() == 0 ? -1 : pool[$urandom_range(0, pool.size() - 1)];
     endfunction
@@ -146,8 +180,9 @@ module testbench;
         for (int i = 0; i < W; i++) begin src1_tag[i] = 41; src2_tag[i] = 41; end
         step("broadcast + read p41");
 
-        // 5) p0 is never busy, even if set_en targets it
-        $display("Test 5: p0 is always ready");
+        // 5) p0 is never busy, even if set_en targets it (FP: local preg 0 is an ordinary register)
+        if (ZR) $display("Test 5: p0 is always ready");
+        else    $display("Test 5: preg 0 (initial f0) can be busy like any other");
         idle(); set_en[0] = 1; set_tag[0] = 0;
         step("set p0");
         idle(); src1_tag[0] = 0; src2_tag[0] = 0;
@@ -172,6 +207,18 @@ module testbench;
         step("flush");
         check_all("after flush");
 
+        // 7b) the other class: its tags read ready, and its sets / broadcasts change nothing here
+        $display("Test 7b: tags of the other register class are ignored");
+        idle(); for (int i = 0; i < W; i++) begin set_en[i] = 1; set_tag[i] = TAG_W'(44 + i); end
+        step("set 44.. in this class");
+        other_class = 1;
+        idle(); for (int i = 0; i < W; i++) begin set_en[i] = 1; set_tag[i] = TAG_W'(48 + i); src1_tag[i] = TAG_W'(44 + i); end
+        step("set the other class's 48..; read its 44..");
+        idle(); for (int k = 0; k < C && k < W; k++) begin cdb_valid[k] = 1; cdb_tag[k] = TAG_W'(44 + k); end
+        step("broadcast the other class's 44..");
+        other_class = 0;
+        check_all("this class unchanged by the other class");
+
         // 8) random traffic: set only free tags, broadcast only busy tags (as the core does)
         $display("Test 8: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
@@ -191,7 +238,10 @@ module testbench;
                 // bias lookups toward tags touched this cycle so the bypass gets exercised
                 src1_tag[i] = (used.size() > 0 && $urandom % 2 == 1) ? TAG_W'(used[$urandom_range(0, used.size()-1)])
                                                                  : TAG_W'($urandom);
-                src2_tag[i] = TAG_W'($urandom);
+                src2_tag[i] = TAG_W'($urandom % NTAG);
+                src3_tag[i] = (used.size() > 0 && $urandom % 2 == 1) ? TAG_W'(used[$urandom_range(0, used.size()-1)])
+                                                                 : TAG_W'($urandom % NTAG);
+                if (src1_tag[i] >= NTAG) src1_tag[i] = TAG_W'(src1_tag[i] % NTAG);
             end
             flush = ($urandom % 200 == 0);
             step("random");

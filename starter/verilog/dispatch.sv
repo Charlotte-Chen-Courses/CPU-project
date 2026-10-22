@@ -3,15 +3,20 @@
 //   Modulename :  dispatch.sv                                         //
 //                                                                     //
 //  Description :  Decode + rename + dispatch for one fetch bundle.    //
-//                 Contains the decoders, freelist, speculative RAT    //
-//                 and busy table, and produces the ROB and RS entries //
-//                 for the bundle. Rules:                              //
-//                  - fire = any valid && freelist can_alloc_w &&      //
-//                    rob_space_ok && rs_space_ok && LQ/SQ space. All  //
-//                    state-only (never the request-dependent          //
+//                 Contains the decoders and, per register class (x    //
+//                 and f), a freelist, speculative RAT and busy table, //
+//                 and produces the ROB and RS entries for the bundle. //
+//                 Rules:                                              //
+//                  - fire = any valid && both freelists can_alloc_w   //
+//                    && rob_space_ok && rs_space_ok && LQ/SQ space.   //
+//                    All state-only (never the request-dependent      //
 //                    alloc_ok), so there is no combinational loop.    //
 //                    The bundle renames whole or not at all.          //
-//                  - dest_valid = valid && has_dest && rd != x0.      //
+//                  - each operand picks its class on its own          //
+//                    (rs1_fp/rs2_fp/rd_fp; rs3 is always f): RAT,     //
+//                    busy table, same-bundle bypass, freelist, told.  //
+//                  - dest_valid = valid && has_dest && (rd is an f    //
+//                    register, or rd != x0): f0 is a real register.   //
 //                  - freelist alloc_req, busy-table set_en, RAT       //
 //                    writes and ROB/RS writes happen only on fire.    //
 //                  - src ready = the field is not a register          //
@@ -22,13 +27,22 @@
 //                  - RS dest_tag = dest_valid ? new tag : p0.         //
 //                  - slots younger than a WFI in the bundle are       //
 //                    dropped (never enter the ROB).                   //
-//                  - flush (mispredict at commit): no dispatch; the   //
-//                    freelist rewinds, the RAT loads recover_map, the //
-//                    busy table clears.                               //
-//                 Anything else (illegal, or no unit yet: FP, CSR, A) //
-//                 gets a ROB entry that is done at                    //
-//                 dispatch with an exception and no destination, and  //
-//                 never enters the RS; the ROB raises it at commit.   //
+//                  - fcsr CSR ops (fflags/frm/fcsr) and atomics are   //
+//                    serial: they issue only at the ROB head, and     //
+//                    nothing dispatches after one until the ROB is    //
+//                    empty (fetch ends the bundle after it). CSR ops  //
+//                    go to the FP unit, atomics (LR too) to the store //
+//                    port without an LQ/SQ entry.                     //
+//                  - commit frees told to its class's freelist        //
+//                    (free_fp).                                       //
+//                  - flush (mispredict or replay at commit): no       //
+//                    dispatch; both freelists rewind, both RATs load  //
+//                    their recover maps, both busy tables clear.      //
+//                 Anything else (illegal, or no unit yet: other CSRs, //
+//                 all of F when NUM_FU_FP = 0, A when A_EXTENSION =   //
+//                 0) gets a ROB entry that is done at dispatch with   //
+//                 an exception and no destination, and never enters  //
+//                 the RS; the ROB raises it at commit.                //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -54,6 +68,7 @@ module dispatch #(
 
     // back-pressure (state-only signals from the ROB and RS)
     input                                 rob_space_ok,
+    input                                 rob_empty,     // nothing in flight (ends a serial op's block)
     input                                 rs_space_ok,
     input                                 lq_space_ok,   // >= W free LQ / SQ entries (state only)
     input                                 sq_space_ok,
@@ -75,6 +90,7 @@ module dispatch #(
     output logic [W-1:0]                  disp_is_ret,     // jalr x0, x1/x5
     output logic [W-1:0]                  disp_is_load,    // allocates an LQ entry (gated by fire)
     output logic [W-1:0]                  disp_is_store,   // allocates an SQ entry (gated by fire)
+    output logic [W-1:0]                  disp_dest_fp,    // the destination is an f register
     output logic [W-1:0][`XLEN-1:0]       disp_pred_npc,
 
     // to the RS: only slots that have a functional unit to run on
@@ -85,13 +101,15 @@ module dispatch #(
     input        [CDB_SZ-1:0]             cdb_valid,
     input        [CDB_SZ-1:0][TAG_W-1:0]  cdb_tag,
 
-    // commit: frees old physical registers
+    // commit: frees old physical registers (free_fp: to the FP free list)
     input        [W-1:0]                  free_en,
+    input        [W-1:0]                  free_fp,
     input        [W-1:0][TAG_W-1:0]       free_tag,
 
-    // mispredict recovery (this cycle): no dispatch; restore rename state
+    // mispredict recovery (this cycle): no dispatch; restore rename state of both classes
     input                                 flush,
-    input        [`ARCH_REG_SZ-1:0][TAG_W-1:0] recover_map   // retirement map after this cycle's commits
+    input        [`ARCH_REG_SZ-1:0][TAG_W-1:0] recover_map,     // integer retirement map after this cycle's commits
+    input        [`ARCH_REG_SZ-1:0][TAG_W-1:0] fp_recover_map   // FP retirement map after this cycle's commits
 );
 
   // ---- decode ----
@@ -145,48 +163,94 @@ module dispatch #(
   // ---- instructions this core cannot run yet: they get a ROB entry with an exception (done at
   //      dispatch, no destination, never in the RS). Raised only if they reach commit, so code on
   //      a mispredicted path never stops the machine. ----
-  logic [W-1:0] unsupported, has_dest_eff;
+  logic [W-1:0] unsupported, has_dest_eff, csr_ok, amo_ok;
   EXCEPTION [W-1:0] exc;
   always_comb
     for (int i = 0; i < W; i++) begin
+      // CSR ops on fflags / frm / fcsr run serialized on the FP unit; any other CSR is unsupported
+      csr_ok[i]      = csr_op[i] && `NUM_FU_FP > 0 && in_inst[i][31:20] inside {12'h001, 12'h002, 12'h003};
+      // LR / SC / AMO: serialized, run by the LSQ's atomic engine on the store port
+      amo_ok[i]      = atomic[i] && `A_EXTENSION != 0;
       unsupported[i] = !((fu_type[i] == FU_ALU && !cond_branch[i] && !uncond_branch[i]) ||
                          (fu_type[i] == FU_BRANCH && (cond_branch[i] || uncond_branch[i])) ||
                          fu_type[i] == FU_MULT || fu_type[i] == FU_DIV ||
-                         (fu_type[i] == FU_LOAD  && rd_mem[i] && !wr_mem[i]) ||
-                         (fu_type[i] == FU_STORE && wr_mem[i] && !rd_mem[i])) ||
-                       csr_op[i] || atomic[i] ||
-                       rs1_fp[i] || rs2_fp[i] || rd_fp[i] || rs3_used[i];
+                         (fu_type[i] == FU_LOAD  && rd_mem[i] && !wr_mem[i]) ||   // incl. flw
+                         (fu_type[i] == FU_STORE && wr_mem[i] && !rd_mem[i]) ||   // incl. fsw
+                         fu_type[i] == FU_FP || amo_ok[i]) ||
+                       (csr_op[i] && !csr_ok[i]) || (atomic[i] && !amo_ok[i]) ||
+                       // no FP unit (NUM_FU_FP = 0): all of F, flw/fsw included, stays unsupported
+                       (`NUM_FU_FP == 0 && (fu_type[i] == FU_FP || rs1_fp[i] || rs2_fp[i] || rd_fp[i] || rs3_used[i]));
       exc[i]          = (in_exc[i] != EXC_NONE) ? in_exc[i] :
                         illegal[i] ? EXC_ILLEGAL : unsupported[i] ? EXC_UNSUPPORTED : EXC_NONE;
       has_dest_eff[i] = has_dest[i] && (exc[i] == EXC_NONE);
     end
 
   // ---- rename control ----
-  logic             can_alloc_w;
-  logic [W-1:0]     dest_valid;
-  logic [W-1:0][TAG_W-1:0] new_tag, src1_tag, src2_tag, told;
-  logic [W-1:0]     src1_bypassed, src2_bypassed, src1_free, src2_free;
+  // Two register classes, each with its own free list, RAT and busy table. Every operand picks
+  // its class on its own (fcvt.s.w reads an x register and writes an f register; feq reads f
+  // registers and writes an x register): rs1_fp/rs2_fp/rd_fp, and rs3 is always FP.
+  logic             can_alloc_w, int_can_alloc_w, fp_can_alloc_w;
+  logic             serial_pending;
+  logic [W-1:0]     dest_valid, int_dest, fp_dest;
+  logic [W-1:0][TAG_W-1:0] new_tag, src1_tag, src2_tag, src3_tag, told;
+  logic [W-1:0]     src1_bypassed, src2_bypassed, src3_bypassed;
+  logic [W-1:0]     src1_free, src2_free, src3_free;
+  logic [W-1:0][TAG_W-1:0] int_new, int_src1, int_src2, int_told;
+  logic [W-1:0][TAG_W-1:0] fp_new, fp_src1, fp_src2, fp_src3, fp_told;
+  logic [W-1:0]     int_byp1, int_byp2, fp_byp1, fp_byp2, fp_byp3;
+  logic [W-1:0]     int_rdy1, int_rdy2, int_rdy3, fp_rdy1, fp_rdy2, fp_rdy3;
+  logic [W-1:0][4:0] rs3;
 
+  assign can_alloc_w = int_can_alloc_w && fp_can_alloc_w;   // state only: both lists have W free
   assign fire = (|slot_valid) && can_alloc_w && rob_space_ok && rs_space_ok && lq_space_ok && sq_space_ok
-                && !flush;
+                && !flush && !serial_pending;
+
+  // A serial op (fcsr CSR op) is the youngest instruction until it commits: nothing dispatches
+  // after it (fetch ends its bundle and refetches from its pc+4), and its RS entry issues only
+  // as the oldest instruction. Every flush clears the block (a serial op on a wrong path).
+  always_ff @(posedge clock)
+    if (reset || flush)                                              serial_pending <= `FALSE;
+    else if (fire && |(slot_valid & (csr_ok | amo_ok) & ~unsupported & ~illegal)) serial_pending <= `TRUE;
+    else if (rob_empty)                                              serial_pending <= `FALSE;
 
   always_comb
-    for (int i = 0; i < W; i++) dest_valid[i] = slot_valid[i] && has_dest_eff[i] && (rd[i] != '0);
+    for (int i = 0; i < W; i++) begin
+      rs3[i]        = in_inst[i][31:27];
+      // x0 as a destination means none; f0 is a real register
+      dest_valid[i] = slot_valid[i] && has_dest_eff[i] && (rd_fp[i] || rd[i] != '0);
+      int_dest[i]   = dest_valid[i] && !rd_fp[i];
+      fp_dest[i]    = dest_valid[i] && rd_fp[i];
+    end
 
   freelist freelist_0 (
       .clock      (clock),
       .reset      (reset),
-      .alloc_req  (dest_valid & {W{fire}}),
-      .alloc_tag  (new_tag),
+      .alloc_req  (int_dest & {W{fire}}),
+      .alloc_tag  (int_new),
       /* verilator lint_off PINCONNECTEMPTY */
       .alloc_ok   (),                  // request-dependent: deliberately unused (see fire)
       /* verilator lint_on PINCONNECTEMPTY */
-      .can_alloc_w(can_alloc_w),
-      .free_en    (free_en),
+      .can_alloc_w(int_can_alloc_w),
+      .free_en    (free_en & ~free_fp),
       .free_tag   (free_tag),
       .flush      (flush)
   );
 
+  freelist #(.BASE(`FP_TAG_BASE), .FL_SZ(`FP_FREE_LIST_SZ), .ZERO_REG(1'b0)) fp_freelist_0 (
+      .clock      (clock),
+      .reset      (reset),
+      .alloc_req  (fp_dest & {W{fire}}),
+      .alloc_tag  (fp_new),
+      /* verilator lint_off PINCONNECTEMPTY */
+      .alloc_ok   (),
+      /* verilator lint_on PINCONNECTEMPTY */
+      .can_alloc_w(fp_can_alloc_w),
+      .free_en    (free_en & free_fp),
+      .free_tag   (free_tag),
+      .flush      (flush)
+  );
+
+  /* verilator lint_off PINCONNECTEMPTY */
   rat rat_0 (
       .clock        (clock),
       .reset        (reset),
@@ -194,30 +258,91 @@ module dispatch #(
       .valid        (slot_valid),
       .rs1          (rs1),
       .rs2          (rs2),
+      .rs3          ('0),
       .rd           (rd),
-      .has_dest     (has_dest_eff),
-      .new_tag      (new_tag),
-      .src1_tag     (src1_tag),
-      .src2_tag     (src2_tag),
-      .told         (told),
-      .src1_bypassed(src1_bypassed),
-      .src2_bypassed(src2_bypassed),
+      .has_dest     (has_dest_eff & ~rd_fp),
+      .new_tag      (int_new),
+      .src1_tag     (int_src1),
+      .src2_tag     (int_src2),
+      .src3_tag     (),
+      .told         (int_told),
+      .src1_bypassed(int_byp1),
+      .src2_bypassed(int_byp2),
+      .src3_bypassed(),
       .recover      (flush),
       .recover_map  (recover_map)
   );
+  /* verilator lint_on PINCONNECTEMPTY */
+
+  rat #(.BASE(`FP_TAG_BASE), .ZERO_REG(1'b0)) fp_rat_0 (
+      .clock        (clock),
+      .reset        (reset),
+      .rename_en    (fire),
+      .valid        (slot_valid),
+      .rs1          (rs1),
+      .rs2          (rs2),
+      .rs3          (rs3),
+      .rd           (rd),
+      .has_dest     (has_dest_eff & rd_fp),
+      .new_tag      (fp_new),
+      .src1_tag     (fp_src1),
+      .src2_tag     (fp_src2),
+      .src3_tag     (fp_src3),
+      .told         (fp_told),
+      .src1_bypassed(fp_byp1),
+      .src2_bypassed(fp_byp2),
+      .src3_bypassed(fp_byp3),
+      .recover      (flush),
+      .recover_map  (fp_recover_map)
+  );
+
+  // per-operand class selection
+  always_comb
+    for (int i = 0; i < W; i++) begin
+      new_tag[i]       = rd_fp[i]  ? fp_new[i]  : int_new[i];
+      told[i]          = rd_fp[i]  ? fp_told[i] : int_told[i];
+      src1_tag[i]      = rs1_fp[i] ? fp_src1[i] : int_src1[i];
+      src1_bypassed[i] = rs1_fp[i] ? fp_byp1[i] : int_byp1[i];
+      src2_tag[i]      = rs2_fp[i] ? fp_src2[i] : int_src2[i];
+      src2_bypassed[i] = rs2_fp[i] ? fp_byp2[i] : int_byp2[i];
+      src3_tag[i]      = fp_src3[i];
+      src3_bypassed[i] = fp_byp3[i];
+      // each busy table reads the other class's tags as ready, so AND picks the right one
+      src1_free[i]     = int_rdy1[i] && fp_rdy1[i];
+      src2_free[i]     = int_rdy2[i] && fp_rdy2[i];
+      src3_free[i]     = int_rdy3[i] && fp_rdy3[i];
+    end
 
   busy_table busy_table_0 (
       .clock     (clock),
       .reset     (reset),
-      .set_en    (dest_valid & {W{fire}}),
-      .set_tag   (new_tag),
+      .set_en    (int_dest & {W{fire}}),
+      .set_tag   (int_new),
       .cdb_valid (cdb_valid),
       .cdb_tag   (cdb_tag),
       .flush     (flush),
       .src1_tag  (src1_tag),
       .src2_tag  (src2_tag),
-      .src1_ready(src1_free),
-      .src2_ready(src2_free)
+      .src3_tag  (src3_tag),
+      .src1_ready(int_rdy1),
+      .src2_ready(int_rdy2),
+      .src3_ready(int_rdy3)
+  );
+
+  busy_table #(.BASE(`FP_TAG_BASE), .BUSY_TABLE_SZ(`FP_PHYS_REG_SZ), .ZERO_REG(1'b0)) fp_busy_table_0 (
+      .clock     (clock),
+      .reset     (reset),
+      .set_en    (fp_dest & {W{fire}}),
+      .set_tag   (fp_new),
+      .cdb_valid (cdb_valid),
+      .cdb_tag   (cdb_tag),
+      .flush     (flush),
+      .src1_tag  (src1_tag),
+      .src2_tag  (src2_tag),
+      .src3_tag  (src3_tag),
+      .src1_ready(fp_rdy1),
+      .src2_ready(fp_rdy2),
+      .src3_ready(fp_rdy3)
   );
 
   // ---- ROB and RS entries ----
@@ -239,8 +364,10 @@ module dispatch #(
       disp_is_ret[i]     = uncond_branch[i] && in_inst[i][6:0] == `RV32_JALR_OP && rd[i] == 5'd0
                            && (rs1[i] == 5'd1 || rs1[i] == 5'd5);
       disp_pred_npc[i]   = in_pred_npc[i];
-      disp_is_load[i]    = disp_valid[i] && exc[i] == EXC_NONE && fu_type[i] == FU_LOAD;
-      disp_is_store[i]   = disp_valid[i] && exc[i] == EXC_NONE && fu_type[i] == FU_STORE;
+      // (atomics take no LQ / SQ entry)
+      disp_is_load[i]    = disp_valid[i] && exc[i] == EXC_NONE && fu_type[i] == FU_LOAD  && !atomic[i];
+      disp_is_store[i]   = disp_valid[i] && exc[i] == EXC_NONE && fu_type[i] == FU_STORE && !atomic[i];
+      disp_dest_fp[i]    = fp_dest[i];
 
       disp_pkt[i]            = '0;
       disp_pkt[i].inst       = in_inst[i];
@@ -250,10 +377,13 @@ module dispatch #(
       disp_pkt[i].src1_ready = !rs1_used[i] || (src1_free[i] && !src1_bypassed[i]);
       disp_pkt[i].src2_tag   = src2_tag[i];
       disp_pkt[i].src2_ready = !rs2_used[i] || (src2_free[i] && !src2_bypassed[i]);
+      disp_pkt[i].src3_tag   = src3_tag[i];
+      disp_pkt[i].src3_ready = !rs3_used[i] || (src3_free[i] && !src3_bypassed[i]);
+      disp_pkt[i].serial     = csr_ok[i] || amo_ok[i];
       disp_pkt[i].dest_tag   = dest_valid[i] ? new_tag[i] : '0;
       disp_pkt[i].rob_idx    = rob_idx[i];
       disp_pkt[i].lsq_idx    = lsq_idx[i];
-      disp_pkt[i].fu_type    = fu_type[i];
+      disp_pkt[i].fu_type    = csr_ok[i] ? FU_FP : amo_ok[i] ? FU_STORE : fu_type[i];
       disp_pkt[i].alu_func   = alu_func[i];
       disp_pkt[i].opa_select = opa_select[i];
       disp_pkt[i].opb_select = opb_select[i];

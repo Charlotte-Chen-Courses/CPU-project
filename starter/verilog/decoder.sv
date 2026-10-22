@@ -273,6 +273,7 @@ module decoder (
                 `RV32_CSRRW, `RV32_CSRRS, `RV32_CSRRC,
                 `RV32_CSRRWI, `RV32_CSRRSI, `RV32_CSRRCI: begin
                     csr_op   = `TRUE;
+                    has_dest = `TRUE;       // rd gets the old CSR value
                     rs1_used = !inst[14];   // the immediate forms hold a 5-bit uimm there
                     rs2_used = `FALSE;      // part of the CSR number
                 end
