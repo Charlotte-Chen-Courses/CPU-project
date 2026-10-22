@@ -206,6 +206,19 @@ module lsq #(
     end
   end
 
+  // ---------------- atomic engine state (see "atomics" below) ----------------
+  typedef enum logic [2:0] {AT_IDLE, AT_DRAIN, AT_READ, AT_WAIT, AT_WRITE, AT_DONE} AT_STATE;
+  AT_STATE               at_state;
+  logic [`XLEN-1:0]      at_addr, at_src, at_wdata, at_result;
+  logic [4:0]            at_f5;
+  logic [`TAG_W-1:0]     at_tag;
+  logic [`ROB_IDX_W-1:0] at_rob;
+  logic [ID_W-1:0]       at_id;
+  EXCEPTION              at_exc;
+  logic                  resv_v;           // LR reservation
+  logic [`XLEN-1:2]      resv_word;
+  logic                  st_is_amo, at_start;
+
   // ---------------- address generation ----------------
   logic [`XLEN-1:0] ld_addr, st_addr;
   MEM_SIZE          ld_size, st_size;
@@ -252,19 +265,7 @@ module lsq #(
     end
   end
 
-  // ---------------- atomics ----------------
-  typedef enum logic [2:0] {AT_IDLE, AT_DRAIN, AT_READ, AT_WAIT, AT_WRITE, AT_DONE} AT_STATE;
-  AT_STATE               at_state;
-  logic [`XLEN-1:0]      at_addr, at_src, at_wdata, at_result;
-  logic [4:0]            at_f5;
-  logic [`TAG_W-1:0]     at_tag;
-  logic [`ROB_IDX_W-1:0] at_rob;
-  logic [ID_W-1:0]       at_id;
-  EXCEPTION              at_exc;
-  logic                  resv_v;           // LR reservation
-  logic [`XLEN-1:2]      resv_word;
-  logic                  st_is_amo, at_start;
-
+  // ---------------- atomics (state declared above, with the address generation) ----------------
   assign st_is_amo = (st_in_pkt.inst[6:0] == 7'b0101111);
   assign at_start  = st_in_valid && st_ready && st_is_amo && !flush;
 

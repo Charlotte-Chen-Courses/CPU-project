@@ -210,6 +210,10 @@ module cpu #(
   );
 
   // ---------------- dispatch ----------------
+  localparam LD_PORT = `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV;   // port_type() order
+  localparam ST_PORT = LD_PORT + `NUM_FU_LOAD;
+  logic                         lq_space_ok, sq_space_ok;
+  logic [W-1:0][`LSQ_IDX_W-1:0] disp_lsq_idx;
   logic                        rob_space_ok, rs_space_ok;
   logic [W-1:0][ROB_IDX_W-1:0] rob_disp_idx;
   logic [W-1:0]                disp_valid, disp_dest_valid, disp_halt, rs_disp_valid;
@@ -590,10 +594,7 @@ module cpu #(
   end
 
   // ---------------- load/store queue ----------------
-  localparam LD_PORT = `NUM_FU_ALU + `NUM_FU_BRANCH + `NUM_FU_MULT + `NUM_FU_DIV;   // port_type() order
-  localparam ST_PORT = LD_PORT + `NUM_FU_LOAD;
-  logic                         lq_space_ok, sq_space_ok;
-  logic [W-1:0][`LSQ_IDX_W-1:0] disp_lsq_idx;
+  // (LD_PORT / ST_PORT and the dispatch-side LSQ signals are declared with dispatch, above)
   logic                         dc_req_valid, dc_req_ready, dc_req_store, dc_resp_valid;
   logic [`XLEN-1:0]             dc_req_addr, dc_req_data, dc_resp_data;
   MEM_SIZE                      dc_req_size;

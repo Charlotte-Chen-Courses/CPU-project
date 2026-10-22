@@ -80,14 +80,12 @@
 
 
 // Some useful RV32 instruction macros
-`define RV32_Rtype(op, funct3,
-                   funct7) {``funct7``, {5{1'b?}},  {5{1'b?}},``funct3``, {5{1'b?}},``op``}
+`define RV32_Rtype(op, funct3, funct7) {``funct7``,{5{1'b?}},{5{1'b?}},``funct3``,{5{1'b?}},``op``}
 `define RV32_Itype(op, funct3) {{12{1'b?}},{5{1'b?}},``funct3``,{5{1'b?}},``op``}
 `define RV32_Stype(op, funct3) {{7{1'b?}},{5{1'b?}},{5{1'b?}},``funct3``,{5{1'b?}},``op``}
 `define RV32_Utype(op) {{20{1'b?}},{5{1'b?}},``op``}
 `define RV32_R4type(op, fmt) {{5{1'b?}},``fmt``,{5{1'b?}},{5{1'b?}},{3{1'b?}},{5{1'b?}},``op``}
-`define RV32_Rtype_rs2(op, funct3, funct7,
-                       rs2) {``funct7``, ``rs2``, {5{1'b?}}, ``funct3``, {5{1'b?}}, ``op``}
+`define RV32_Rtype_rs2(op, funct3, funct7, rs2) {``funct7``,``rs2``,{5{1'b?}},``funct3``,{5{1'b?}},``op``}
 
 // We have to delete the white space in micro definition, otherwise Design
 // Compiler would issue warings. PS: I guess nothing is issuing warnings?
@@ -240,11 +238,9 @@
 // RV32 Immediate signed/unsigned(U is technically unsigned) extension macros
 `define RV32_signext_Iimm(instr) {{21{``instr``[31]}},``instr``[30:20]}
 `define RV32_signext_Simm(instr) {{21{``instr``[31]}},``instr[30:25],``instr``[11:7]}
-`define RV32_signext_Bimm(
-    instr) {{20{``instr``[31]}},``instr``[7],``instr``[30:25],``instr``[11:8], {1'b0}}
+`define RV32_signext_Bimm(instr) {{20{``instr``[31]}},``instr``[7],``instr``[30:25],``instr``[11:8], {1'b0}}
 `define RV32_signext_Uimm(instr) {``instr``[31:12], {12{1'b0}}}
-`define RV32_signext_Jimm(
-    instr) {{12{``instr``[31]}},``instr``[19:12],``instr``[20],``instr``[30:21], {1'b0}}
+`define RV32_signext_Jimm(instr) {{12{``instr``[31]}},``instr``[19:12],``instr``[20],``instr``[30:21], {1'b0}}
 
 // RV32 12bit Immediate injection/extraction, replace the Imm content with specified value
 // for injection, input immediate value index starting from 1
@@ -253,8 +249,7 @@
 
 `define RV32_Bimm_12inject1(instr, value) {``value``[12], ``value``[10:5], ``instr``[24:12],\
                                           ``value``[4:1],``value``[11],``instr``[6:1],``instr``[31]}
-`define RV32_Jimm_12inject1(
-    instr, value) {1'b0, ``value``[10:1], ``value``[11], 7'b0,``value``[12], ``instr``[11:0]}
+`define RV32_Jimm_12inject1(instr, value) {1'b0, ``value``[10:1], ``value``[11], 7'b0,``value``[12], ``instr``[11:0]}
 
 `define RV32_Bimm_12extract(instr) {``instr``[31], ``instr``[7], ``instr``[30:25], ``instr``[11:8]};
 `define RV32_Jimm_12extract(instr) {``instr``[12], ``instr``[20],``instr``[30:21] };
