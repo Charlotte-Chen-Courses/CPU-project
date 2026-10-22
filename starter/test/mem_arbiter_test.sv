@@ -6,7 +6,8 @@
 //                 clients (dcache.sv and P3's icache.sv) on one       //
 //                 mem.sv. The D-side runs random loads/stores on a    //
 //                 data region checked against a reference byte array  //
-//                 (every load answer, and final memory = mem.sv with  //
+//                 (every load answer, matched by id since the cache   //
+//                 is non-blocking, and final memory = mem.sv with     //
 //                 the cache's dirty blocks overlaid). The I-side      //
 //                 fetches from a separate code region: mostly         //
 //                 sequential, sometimes jumping, and sometimes        //
@@ -88,7 +89,7 @@ module testbench;
     logic [7:0] ref_mem [`MEM_SIZE_IN_BYTES];
     bit         touched [int];
     typedef struct { logic [`DMEM_ID_W-1:0] id; logic [`XLEN-1:0] word; } exp_t;
-    exp_t exp_q [$];
+    exp_t exp_q [int];                 // by id: responses may come back out of order
     int n_loads = 0, n_resps = 0, n_dreq = 0;
     logic [`DMEM_ID_W-1:0] next_id = 0;
 
@@ -103,16 +104,20 @@ module testbench;
             n_dreq++;
             for (int k = 0; k < n; k++) touched[int'(req_addr) + k] = 1;
             if (req_store) for (int k = 0; k < n; k++) ref_mem[int'(req_addr) + k] = req_data[8 * k +: 8];
-            else begin exp_q.push_back('{id: req_id, word: ref_word(req_addr)}); n_loads++; end
+            else begin
+                if (exp_q.exists(int'(req_id))) fail($sformatf("D: test bug: load id %0d reused while waiting", req_id));
+                exp_q[int'(req_id)] = '{id: req_id, word: ref_word(req_addr)}; n_loads++;
+            end
         end
 
     always @(negedge clock)
         if (!reset && resp_valid) begin
             n_resps++;
-            if (exp_q.size() == 0) fail("D: response with no load outstanding");
+            if (!exp_q.exists(int'(resp_id))) fail($sformatf("D: response for id %0d, which no load is waiting for", resp_id));
             else begin
-                automatic exp_t e = exp_q.pop_front();
-                if (resp_id !== e.id || resp_data !== e.word)
+                automatic exp_t e = exp_q[int'(resp_id)];
+                exp_q.delete(int'(resp_id));
+                if (resp_data !== e.word)
                     fail($sformatf("D: load id %0d got %h, expected %h", e.id, resp_data, e.word));
             end
         end
@@ -120,7 +125,12 @@ module testbench;
     task automatic access(input bit st, input logic [`XLEN-1:0] a, input MEM_SIZE s);
         int guard = 0;
         req_valid = 1; req_store = st; req_addr = a; req_size = s; req_data = $urandom; req_id = next_id;
-        while (!req_ready) begin @(negedge clock); if (++guard > 5000) $fatal(1, "D: request to %h never accepted", a); end
+        // ready depends on the address (full set / full MSHR): sample it once the new request has settled
+        #(`CLOCK_PERIOD / 10.0);
+        while (!req_ready) begin
+            @(negedge clock); #(`CLOCK_PERIOD / 10.0);
+            if (++guard > 5000) $fatal(1, "D: request to %h never accepted", a);
+        end
         @(negedge clock);
         next_id++;
         req_valid = 0;
@@ -198,7 +208,7 @@ module testbench;
             if (n_ifetch == start_n) fail("I side made no progress while the D side was idle");
         end
         running = 0;
-        while (!req_ready || exp_q.size() != 0) @(negedge clock);
+        while (!dcache_0.idle || exp_q.size() != 0) @(negedge clock);
         repeat (3 * int'(`MEM_LATENCY_IN_CYCLES)) @(negedge clock);
 
         begin

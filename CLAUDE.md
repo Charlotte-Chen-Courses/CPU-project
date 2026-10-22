@@ -40,7 +40,12 @@ The analysis IS the deliverable.
   for first-correct, then upgrade.) Measurement of prediction accuracy matters
   more than predictor sophistication.
 - **Non-blocking D-cache with MSHRs** — added only once the core is solid; pairs
-  with the LSQ for a memory-level-parallelism analysis story.
+  with the LSQ for a memory-level-parallelism analysis story. **Implemented
+  2026-10-22:** `DC_MSHRS` (default 4; 0 = blocking, the cut-order fallback) x
+  `DC_TGTS` merged requests each. Merged requests replay in acceptance order
+  (a load sees exactly the requests accepted before it). Victim ways are
+  reserved at allocation, and a dirty victim's writeback is accepted before
+  anything new.
 - **F extension: one floating-point functional unit** — a second register class
   for rename and a second long/variable-latency FU class. See ISA scope.
 - **A extension (atomics)** — LR/SC + AMOs, executed through the LSQ.

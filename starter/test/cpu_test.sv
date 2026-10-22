@@ -912,7 +912,7 @@ module testbench;
         // committed stores may still be draining: wait, then memory = mem.sv + dirty D-cache blocks
         begin
             automatic int g = 0;
-            while ((stores_pending || dut.dcache_0.state != 0) && g < 2000) begin @(negedge clock); g++; end
+            while ((stores_pending || !dut.dcache_0.idle) && g < 2000) begin @(negedge clock); g++; end
             if (g >= 2000) fail($sformatf("[%s] committed stores never drained", name));
             check_memory(name);
         end
@@ -1568,6 +1568,12 @@ module testbench;
         $display("  (I-cache: fetch waited %0d of %0d cycles)", total_istall, total_cycles);
         $display("  (loads %0d, stores %0d committed; %0d loads forwarded from the store queue; D-cache %0d hits, %0d misses, %0d writebacks)",
                  total_ld, total_st, total_fwd, dut.dcache_0.n_hits, dut.dcache_0.n_misses, dut.dcache_0.n_writebacks);
+        begin
+            automatic string occ = "";
+            foreach (dut.dcache_0.occupancy[k]) occ = {occ, $sformatf(" %0d:%0d", k, dut.dcache_0.occupancy[k])};
+            $display("  (DC_MSHRS = %0d: %0d misses merged, %0d hits under a miss, %0d cycles a request was refused; cycles with k MSHRs busy:%s)",
+                     `DC_MSHRS, dut.dcache_0.n_merged, dut.dcache_0.n_hit_under_miss, dut.dcache_0.n_refused, occ);
+        end
         $display("  (LSQ_SPECULATE = %0d: %0d load replays)", `LSQ_SPECULATE, total_replays);
         if (errors == 0) $display("@@@ Passed");
         else             $display("@@@ Failed (%0d errors)", errors);

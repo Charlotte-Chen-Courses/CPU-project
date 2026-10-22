@@ -5,8 +5,8 @@
 //  Description :  Testbench for the data cache, directly on P3's      //
 //                 mem.sv (CACHE_MODE, MEM_LATENCY_IN_CYCLES). A       //
 //                 reference byte array is updated when each request   //
-//                 is accepted; every load response (in order, the     //
-//                 cache is blocking) must match it. At the end the    //
+//                 is accepted; every load response (matched by id:    //
+//                 the cache is non-blocking) must match it. At the end//
 //                 cache's valid dirty blocks are overlaid on mem.sv's //
 //                 memory and every touched byte is compared, which    //
 //                 catches lost or wrong writebacks. Directed: hit     //
@@ -14,7 +14,10 @@
 //                 block, dirty eviction then re-read, LRU order; then //
 //                 random traffic over a hot region, addresses that    //
 //                 alias to the same sets, and far addresses, while    //
-//                 memory randomly refuses requests.                   //
+//                 memory randomly refuses requests; with MSHRs, loads //
+//                 and stores interleaved into a block being fetched,  //
+//                 hits under a miss, and a dirty victim refetched at  //
+//                 once.                                               //
 //                 Prints @@@ Passed/Failed.                           //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
@@ -68,8 +71,9 @@ module testbench;
     logic [7:0] ref_mem [`MEM_SIZE_IN_BYTES];
     bit         touched [int];
     typedef struct { logic [`DMEM_ID_W-1:0] id; logic [`XLEN-1:0] word; } exp_t;
-    exp_t exp_q [$];
-    int errors = 0, n_loads = 0, n_resps = 0;
+    exp_t exp_q [int];                 // by id: responses may come back out of order
+    int   resp_cycle [int];            // cycle each id's response arrived (ordering checks)
+    int errors = 0, n_loads = 0, n_resps = 0, cycle = 0;
     logic [`DMEM_ID_W-1:0] next_id = 0;
 
     task automatic fail(input string m); errors++; $display("  FAIL: %s", m); if (errors > 20) $fatal(1, "too many errors"); endtask
@@ -85,27 +89,36 @@ module testbench;
             automatic int n = (req_size == BYTE) ? 1 : (req_size == HALF) ? 2 : 4;
             for (int k = 0; k < n; k++) touched[int'(req_addr) + k] = 1;
             if (req_store) for (int k = 0; k < n; k++) ref_mem[int'(req_addr) + k] = req_data[8 * k +: 8];
-            else begin exp_q.push_back('{id: req_id, word: ref_word(req_addr)}); n_loads++; end
-        end
-
-    // responses: in order
-    always @(negedge clock)
-        if (!reset && resp_valid) begin
-            n_resps++;
-            if (exp_q.size() == 0) fail("response with no load outstanding");
             else begin
-                automatic exp_t e = exp_q.pop_front();
-                if (resp_id !== e.id || resp_data !== e.word)
-                    fail($sformatf("load id %0d: got %h (id %0d), expected %h", e.id, resp_data, resp_id, e.word));
+                if (exp_q.exists(int'(req_id))) fail($sformatf("test bug: load id %0d reused while waiting", req_id));
+                exp_q[int'(req_id)] = '{id: req_id, word: ref_word(req_addr)}; n_loads++;
             end
         end
+
+    // responses: each must match the load with its id
+    always @(negedge clock) begin
+        cycle++;
+        if (!reset && resp_valid) begin
+            n_resps++;
+            resp_cycle[int'(resp_id)] = cycle;
+            if (!exp_q.exists(int'(resp_id))) fail($sformatf("response for id %0d, which no load is waiting for", resp_id));
+            else begin
+                automatic exp_t e = exp_q[int'(resp_id)];
+                exp_q.delete(int'(resp_id));
+                if (resp_data !== e.word)
+                    fail($sformatf("load id %0d: got %h, expected %h", e.id, resp_data, e.word));
+            end
+        end
+    end
 
     // one request (called at a falling edge); returns at the falling edge after it is accepted
     task automatic access(input bit st, input logic [`XLEN-1:0] a, input MEM_SIZE s, input logic [`XLEN-1:0] d = $urandom);
         int guard = 0;
         req_valid = 1; req_store = st; req_addr = a; req_size = s; req_data = d; req_id = next_id;
+        // ready depends on the address (full set / full MSHR): sample it once the new request has settled
+        #(`CLOCK_PERIOD / 10.0);
         while (!req_ready) begin
-            @(negedge clock);
+            @(negedge clock); #(`CLOCK_PERIOD / 10.0);
             if (++guard > 2000) $fatal(1, "request to %h never accepted", a);
         end
         @(negedge clock);          // the rising edge in between accepted it
@@ -116,7 +129,7 @@ module testbench;
     task automatic wait_idle();
         int guard = 0;
         req_valid = 0;
-        while (!(req_ready && exp_q.size() == 0)) begin @(negedge clock); if (++guard > 2000) $fatal(1, "cache never went idle"); end
+        while (!(dut.idle && exp_q.size() == 0)) begin @(negedge clock); if (++guard > 2000) $fatal(1, "cache never went idle"); end
     endtask
 
     function automatic MEM_SIZE rsize(); return MEM_SIZE'($urandom_range(0, 2)); endfunction
@@ -140,7 +153,10 @@ module testbench;
         $display("Test 1: load miss, then hits in the same block");
         access(0, 32'h100, WORD); access(0, 32'h104, WORD); access(0, 32'h102, HALF); access(0, 32'h107, BYTE);
         wait_idle();
-        if (dut.n_misses != 1 || dut.n_hits != 3) fail($sformatf("expected 1 miss + 3 hits, got %0d + %0d", dut.n_misses, dut.n_hits));
+        if (`DC_MSHRS == 0 && (dut.n_misses != 1 || dut.n_hits != 3))
+            fail($sformatf("expected 1 miss + 3 hits, got %0d + %0d", dut.n_misses, dut.n_hits));
+        if (`DC_MSHRS > 0 && `DC_TGTS >= 4 && (dut.n_misses != 1 || dut.n_merged != 3 || dut.n_hits != 0))   // all join the miss
+            fail($sformatf("expected 1 miss + 3 merged, got %0d + %0d (+ %0d hits)", dut.n_misses, dut.n_merged, dut.n_hits));
 
         $display("Test 2: byte / half / word stores into a cached block, read back");
         access(1, 32'h101, BYTE, 32'hAA); access(1, 32'h106, HALF, 32'hBEEF); access(1, 32'h100, WORD, 32'h1234_5678);
@@ -157,8 +173,9 @@ module testbench;
 
         if (`DC_WAYS == 2) begin
             $display("Test 4: LRU: A, B, A, C (same set) evicts B, so A still hits");
-            access(0, 32'h300, WORD); access(0, 32'h300 + WAY_B, WORD); access(0, 32'h300, WORD);
-            access(0, 32'h300 + 2 * WAY_B, WORD);
+            // (one at a time: with MSHRs, overlapping misses would install in a different order)
+            access(0, 32'h300, WORD); wait_idle(); access(0, 32'h300 + WAY_B, WORD); wait_idle();
+            access(0, 32'h300, WORD); wait_idle(); access(0, 32'h300 + 2 * WAY_B, WORD);
             wait_idle();
             h0 = dut.n_hits; m0 = dut.n_misses;
             access(0, 32'h300, WORD); wait_idle();
@@ -167,7 +184,38 @@ module testbench;
             if (dut.n_misses != m0 + 1) fail("B was not evicted");
         end
 
-        $display("Test 5: 20000 random requests (hot region, same-set aliases, far addresses), memory refuses 30%%");
+        if (`DC_MSHRS > 0) begin
+            automatic int id_miss, id_hit, m0;
+            $display("Test 5: loads and stores interleaved into a block being fetched; a hit under the miss");
+            access(0, 32'h600, WORD);                                   // a cached block, for the hit below
+            wait_idle();
+            m0 = dut.n_misses;
+            id_miss = int'(next_id);
+            access(0, 32'h700, WORD);                                   // primary miss
+            access(1, 32'h700, WORD, 32'h1111_1111);                    // store after the load: must not leak into it
+            access(0, 32'h700, WORD);                                   // sees 1111_1111
+            access(1, 32'h702, BYTE, 32'h22);                           // (merged targets are capped at DC_TGTS:
+            id_hit = int'(next_id);                                     //  later ones wait, still in order)
+            access(0, 32'h600, WORD);                                   // hit under the miss
+            access(0, 32'h700, WORD);                                   // sees 1122_1111
+            access(0, 32'h704, WORD);
+            wait_idle();
+            if (dut.n_misses != m0 + 1) fail($sformatf("%0d misses for one block", dut.n_misses - m0));
+            if (`DC_TGTS >= 4 && !(resp_cycle[id_hit] < resp_cycle[id_miss])) fail("the hit waited for the miss");
+
+            $display("Test 6: a dirty block evicted, then read again at once (writeback before refetch)");
+            for (int r = 0; r < 20; r++) begin
+                automatic logic [`XLEN-1:0] b = 32'h800 + 8 * r;
+                access(1, b, WORD, $urandom); wait_idle();              // b cached and dirty
+                for (int k = 1; k <= `DC_WAYS; k++) access(0, b + k * WAY_B, WORD);   // evict it ...
+                access(0, b, WORD);                                     // ... and want it back right away
+                access(1, b + 4, WORD, $urandom);
+                access(0, b + 4, WORD);
+            end
+            wait_idle();
+        end
+
+        $display("Test 7: 20000 random requests (hot region, same-set aliases, far addresses), memory refuses 30%%");
         refuse_pct = 30;
         for (int n = 0; n < 20000; n++) begin
             automatic MEM_SIZE s = rsize();
@@ -179,9 +227,8 @@ module testbench;
             access($urandom % 3 == 0, align(a, s), s);
             if ($urandom % 8 == 0) begin req_valid = 0; repeat ($urandom_range(1, 3)) @(negedge clock); end
         end
-        wait_idle();
         refuse_pct = 0;
-        repeat (2 * int'(`MEM_LATENCY_IN_CYCLES)) @(negedge clock);   // let mem.sv finish the last writeback
+        wait_idle();                     // (mem.sv writes memory when it accepts a writeback)
 
         // final memory: mem.sv overlaid with the cache's dirty blocks
         begin
@@ -198,8 +245,19 @@ module testbench;
         end
         if (n_resps != n_loads) fail($sformatf("%0d loads, %0d responses", n_loads, n_resps));
 
-        $display("  (%0d hits, %0d misses: hit rate %.1f%%, %0d writebacks)", dut.n_hits, dut.n_misses,
-                 100.0 * dut.n_hits / (dut.n_hits + dut.n_misses), dut.n_writebacks);
+        $display("  (%0d hits, %0d misses, %0d merged into a miss: hit rate %.1f%%, %0d writebacks)", dut.n_hits,
+                 dut.n_misses, dut.n_merged, 100.0 * dut.n_hits / (dut.n_hits + dut.n_misses + dut.n_merged),
+                 dut.n_writebacks);
+        if (`DC_MSHRS > 0) begin
+            automatic string occ = "";
+            foreach (dut.occupancy[k]) occ = {occ, $sformatf(" %0d:%0d", k, dut.occupancy[k])};
+            $display("  (%0d hits under a miss, %0d refused cycles; cycles with k MSHRs busy:%s)",
+                     dut.n_hit_under_miss, dut.n_refused, occ);
+            // the random test must reach what it is meant to check
+            if (dut.n_hit_under_miss < 100)                 fail("too few hits under a miss");
+            if (`DC_TGTS > 1 && dut.n_merged < 100)         fail("too few merged misses");
+            if (dut.occupancy[`DC_MSHRS] < 10)              fail("(almost) never ran with all MSHRs busy");
+        end
         if (errors == 0) $display("@@@ Passed");
         else             $display("@@@ Failed (%0d errors)", errors);
         $finish;

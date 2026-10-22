@@ -73,6 +73,10 @@
 `define DC_SZ   4096
 `define DC_WAYS 2
 `define DC_BLK  8
+// non-blocking: MSHRs (0 = blocking, one miss at a time) and the requests each can hold.
+// MSHRs * targets must stay well below 2^DMEM_ID_W (load ids are not reused while waiting).
+`define DC_MSHRS 4
+`define DC_TGTS  4
 
 // functional units (you should decide if you want more or fewer types of FUs)
 
