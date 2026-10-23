@@ -113,6 +113,12 @@ module cpu #(
   logic [`XLEN-1:0] i_addr, d_addr;
   logic [63:0]      d_data, mem_rdata;
   logic [3:0]       i_response, i_tag, d_response, d_tag;
+  // instruction stream buffer
+  logic             pf_ready, pf_wait, pf_take, probe_hit;
+  logic [63:0]      pf_data;
+  logic [`XLEN-1:0] probe_addr, p_addr;
+  logic [1:0]       p_command;
+  logic [3:0]       p_response;
 
   assign pc_in_range = (pc < `MEM_SIZE_IN_BYTES);
 
@@ -127,7 +133,32 @@ module cpu #(
       .proc2Imem_command (i_command),
       .proc2Imem_addr    (i_addr),
       .Icache_data_out   (icache_block),
-      .Icache_valid_out  (icache_valid)
+      .Icache_valid_out  (icache_valid),
+      .pf_ready          (pf_ready),
+      .pf_wait           (pf_wait),
+      .pf_data           (pf_data),
+      .pf_take           (pf_take),
+      .probe_addr        (probe_addr),
+      .probe_hit         (probe_hit)
+  );
+
+  iprefetch iprefetch_0 (
+      .clock        (clock),
+      .reset        (reset),
+      .cur_addr     (pc_in_range ? pc : '0),
+      .pf_ready     (pf_ready),
+      .pf_wait      (pf_wait),
+      .pf_data      (pf_data),
+      .pf_take      (pf_take),
+      .miss_accepted(i_command != BUS_NONE && i_response != 4'd0),
+      .miss_addr    (i_addr),
+      .probe_addr   (probe_addr),
+      .probe_hit    (probe_hit),
+      .p_command    (p_command),
+      .p_addr       (p_addr),
+      .p_response   (p_response),
+      .i_tag        (i_tag),
+      .rdata        (mem_rdata)
   );
 
   // the first slot predicted taken redirects fetch; younger slots in the bundle are dropped
@@ -681,12 +712,16 @@ module cpu #(
       .d_command   (d_command),
       .d_addr      (d_addr),
       .d_data      (d_data),
+      .d_prefetch  (1'b0),
       .d_response  (d_response),
       .d_tag       (d_tag),
       .i_command   (i_command),
       .i_addr      (i_addr),
       .i_response  (i_response),
       .i_tag       (i_tag),
+      .p_command   (p_command),
+      .p_addr      (p_addr),
+      .p_response  (p_response),
       .rdata       (mem_rdata),
       .mem_command (proc2mem_command),
       .mem_addr    (proc2mem_addr),

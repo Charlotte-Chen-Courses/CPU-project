@@ -26,7 +26,7 @@ DEPS_prf :=
 DEPS_dcache  := $(SRC)/test/mem.sv
 # the I-cache's data bank (ASAP7 SRAM simulation model; synthesis links the macro instead)
 ICACHE_SRAM_MODEL := $(SRC)/vendor/asap7_sram/srambank_128x4x64_6t122.v
-DEPS_mem_arbiter := $(SRC)/verilog/dcache.sv $(SRC)/verilog/icache.sv $(ICACHE_SRAM_MODEL) $(SRC)/test/mem.sv
+DEPS_mem_arbiter := $(SRC)/verilog/dcache.sv $(SRC)/verilog/icache.sv $(SRC)/verilog/iprefetch.sv $(ICACHE_SRAM_MODEL) $(SRC)/test/mem.sv
 DEPS_lsq     := $(SRC)/test/tb_dmem.sv
 DEPS_mult_fu := $(addprefix $(SRC)/verilog/, mult.sv mult_stage.sv)
 # CVFPU v0.8.1 (git submodule vendor/cvfpu, FP32 only; its own submodules common_cells and
@@ -64,13 +64,15 @@ CFLAGS_fp_fu  := -I$(SPIKE_ROOT)/include/softfloat
 DEPS_cpu := $(addprefix $(SRC)/verilog/, dispatch.sv decoder.sv freelist.sv rat.sv busy_table.sv \
               rob.sv retire_rat.sv rs.sv prf.sv alu_fu.sv branch_fu.sv mult_fu.sv mult.sv mult_stage.sv div_fu.sv \
               branch_pred.sv ras.sv cdb_arbiter.sv \
-              icache.sv dcache.sv mem_arbiter.sv lsq.sv load_wait_table.sv fp_fu.sv) $(SRC)/test/mem.sv \
+              icache.sv iprefetch.sv dcache.sv mem_arbiter.sv lsq.sv load_wait_table.sv fp_fu.sv) $(SRC)/test/mem.sv \
             $(VENDOR_FPU) $(ICACHE_SRAM_MODEL)
 CSRC_cpu    := $(CSRC_fp_fu)
 LDFLAGS_cpu := $(LDFLAGS_fp_fu)
 CFLAGS_cpu  := $(CFLAGS_fp_fu)
 
-CLOCK_PERIOD ?= 10
+# ns. 1.53 = Design Compiler's period for the core (ASAP7, 2026-10-22), so mem.sv's 100 ns is
+# a realistic ~66 cycles. CLOCK_PERIOD=10 gives the old 10-cycle memory (faster simulations).
+CLOCK_PERIOD ?= 1.53
 
 VERILATOR       := verilator
 VERILATOR_FLAGS := --binary --timing -j 0 -Wall -Wno-fatal \

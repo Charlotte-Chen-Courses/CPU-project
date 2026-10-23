@@ -46,6 +46,11 @@ The analysis IS the deliverable.
   (a load sees exactly the requests accepted before it). Victim ways are
   reserved at allocation, and a dirty victim's writeback is accepted before
   anything new.
+- **Prefetch (added 2026-10-22, after MSHRs).** I-side: a stream buffer
+  (`iprefetch.sv`, `IPF_DEPTH`, default 4; 0 = off) beside the single-port I$
+  SRAM. D-side: planned, a stream prefetcher on miss addresses using spare MSHRs.
+  Prefetches have the lowest memory priority (arbiter: D demand > I demand >
+  D prefetch > I prefetch) and a cap on requests in flight.
 - **F extension: one floating-point functional unit** — a second register class
   for rename and a second long/variable-latency FU class. See ISA scope.
 - **A extension (atomics)** — LR/SC + AMOs, executed through the LSQ.

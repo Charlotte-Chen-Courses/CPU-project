@@ -1234,17 +1234,24 @@ module testbench;
         run_program("partial overlap");
 
         $display("Test 23: store address from a slow divide; a later same-address load is replayed (or waits)");
+        // Twice: with slow memory, cold straight-line code is fetched about as fast as a divide chain
+        // runs, so the first pass may never let the load run ahead; the second runs from the I-cache.
         start_program();
         emit(enc_i(3'b000, 11, 0, 12'd1));
-        emit(enc_r(7'b0000001, 3'b101, 9, DREG, 11));             // x9 = x28 / 1 (34 cycles)
+        emit(enc_i(3'b000, 20, 0, 12'd2));                         // x20 = passes
+        emit(enc_r(7'b0000001, 3'b101, 9, DREG, 11));             // loop: x9 = x28 / 1 (34 cycles)
         emit(enc_store(3'b010, 5, 9, 12'd4));                      // address unknown for a while
         emit(enc_load(3'b010, 6, DREG, 12'd4));                    // same address
         emit(enc_load(3'b010, 7, DREG, 12'd12));                   // different address
+        emit(enc_i(3'b000, 20, 20, -12'd1));
+        emit(enc_b(3'b001, 20, 0, -20));                           // bne x20, x0, loop
         run_program("unknown store address");
         $display("  (%0d load replays)", last_replays);
-        if (last_replays != (`LSQ_SPECULATE != 0 ? 1 : 0))
-            fail($sformatf("unknown store address: %0d replays, expected %0d (only the same-address load violates)",
-                           last_replays, `LSQ_SPECULATE != 0 ? 1 : 0));
+        // only the same-address load violates: once per pass that runs ahead (the cold pass may not),
+        // and with the load-wait table only the first of them
+        if (`LSQ_SPECULATE == 0 ? last_replays != 0 : `LSQ_SPECULATE == 2 ? last_replays != 1 :
+                                  (last_replays < 1 || last_replays > 2))
+            fail($sformatf("unknown store address: %0d replays (only the same-address load violates)", last_replays));
 
         $display("Test 23b: the same conflict in a 20-iteration loop: replayed every time, or (LSQ_SPECULATE = 2) once");
         start_program();
@@ -1566,6 +1573,9 @@ module testbench;
         $display("  (FP port: %0d issues, refused work %0d cycles, results waited for a CDB %0d cycles; FP free list stalled dispatch %0d cycles)",
                  fp_issue, fp_blocked, fp_cdb_wait, stall_fp_freelist);
         $display("  (I-cache: fetch waited %0d of %0d cycles)", total_istall, total_cycles);
+        $display("  (IPF_DEPTH = %0d: %0d prefetches issued, %0d used, %0d dropped, %0d skipped as cached, %0d cycles fetch waited for one)",
+                 `IPF_DEPTH, dut.iprefetch_0.n_issued, dut.iprefetch_0.n_useful, dut.iprefetch_0.n_dropped,
+                 dut.iprefetch_0.n_skipped, dut.iprefetch_0.n_late);
         $display("  (loads %0d, stores %0d committed; %0d loads forwarded from the store queue; D-cache %0d hits, %0d misses, %0d writebacks)",
                  total_ld, total_st, total_fwd, dut.dcache_0.n_hits, dut.dcache_0.n_misses, dut.dcache_0.n_writebacks);
         begin

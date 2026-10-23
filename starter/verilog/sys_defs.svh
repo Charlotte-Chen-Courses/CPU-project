@@ -77,6 +77,8 @@
 // MSHRs * targets must stay well below 2^DMEM_ID_W (load ids are not reused while waiting).
 `define DC_MSHRS 4
 `define DC_TGTS  4
+// instruction stream buffer: blocks fetched ahead of the I-cache after a miss (0 = off)
+`define IPF_DEPTH 4
 
 // functional units (you should decide if you want more or fewer types of FUs)
 

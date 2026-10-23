@@ -16,6 +16,11 @@
 //                    cycle: one bubble per miss).                     //
 //                  - ICACHE_SRAM = 0: flip-flops, combinational read  //
 //                    (next_addr unused), any size.                    //
+//                 With the stream buffer (iprefetch.sv): a missing    //
+//                 block the buffer holds is installed from it (pf_take)//
+//                 like a memory fill; one it is still fetching is     //
+//                 waited for (no miss is sent). A second tag port     //
+//                 (probe) lets it skip blocks that are already here.  //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -68,7 +73,17 @@ module icache (
 
     // To fetch stage
     output logic [63:0] Icache_data_out, // Data is mem[proc2Icache_addr]
-    output logic        Icache_valid_out // When valid is high
+    output logic        Icache_valid_out, // When valid is high
+
+    // stream buffer (iprefetch.sv; all 0 when it is off)
+    input               pf_ready,         // it holds the block at proc2Icache_addr: pf_data
+    input               pf_wait,          // it is fetching that block
+    input  [63:0]       pf_data,
+    output logic        pf_take,          // installing pf_data this cycle
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  [`XLEN-1:0]  probe_addr,       // (only the bits this 64 KB memory uses)
+    /* verilator lint_on UNUSEDSIGNAL */
+    output logic        probe_hit         // the block at probe_addr is here
 );
 
     // ---- Tags (13 bits of line address, since only 16 bits address all memory) ---- //
@@ -89,6 +104,11 @@ module icache (
     assign tag_hit          = valids[current_index] && (tags[current_index] == current_tag);
     assign Icache_valid_out = tag_hit && data_ok;
 
+    logic [12-`CACHE_LINE_BITS:0]  probe_tag;
+    logic [`CACHE_LINE_BITS - 1:0] probe_index;
+    assign {probe_tag, probe_index} = probe_addr[15:3];
+    assign probe_hit = valids[probe_index] && (tags[probe_index] == probe_tag);
+
     // ---- Main cache logic ---- //
 
     logic [3:0] current_mem_tag; // The current memory tag we might be waiting on
@@ -101,6 +121,12 @@ module icache (
     // redirect during a miss would then fetch wrong instructions).
     wire got_mem_data = (current_mem_tag == Imem2proc_tag) && (current_mem_tag != 0) && !changed_addr;
 
+    // the stream buffer has the missing block (install it now) or is fetching it (wait for it)
+    wire pf_cover = pf_ready || pf_wait;
+    assign pf_take = !tag_hit && pf_ready && !got_mem_data;
+    wire got_data = got_mem_data || pf_take;
+    wire [63:0] fill_data = pf_take ? pf_data : Imem2proc_data;
+
     // Set mem tag to zero if we changed_addr, and keep resetting while there is
     // a miss_outstanding. Then set to zero when we got_mem_data.
     // (this relies on Imem2proc_response being zero when there is no request)
@@ -109,11 +135,11 @@ module icache (
     // If we have a new miss or still waiting for the response tag, we might
     // need to wait for the response tag because dcache has priority over icache
     // (a miss is a tag miss: data that is merely not read out yet is not one)
-    wire unanswered_miss = changed_addr ? !tag_hit
-                                        : miss_outstanding && (Imem2proc_response == 0);
+    wire unanswered_miss = changed_addr ? !tag_hit && !pf_cover
+                                        : miss_outstanding && (Imem2proc_response == 0) && !pf_cover;
 
     // Keep sending memory requests until we receive a response tag or change addresses
-    assign proc2Imem_command = (miss_outstanding && !changed_addr) ? BUS_LOAD : BUS_NONE;
+    assign proc2Imem_command = (miss_outstanding && !changed_addr && !pf_cover) ? BUS_LOAD : BUS_NONE;
     assign proc2Imem_addr    = {proc2Icache_addr[31:3],3'b0};
 
     // ---- Cache state registers ---- //
@@ -132,7 +158,7 @@ module icache (
             if (update_mem_tag) begin
                 current_mem_tag <= Imem2proc_response;
             end
-            if (got_mem_data) begin // If data came from memory, meaning tag matches
+            if (got_data) begin // If data came from memory (tag matches) or the stream buffer
                 tags[current_index]   <= current_tag;
                 valids[current_index] <= 1;
             end
@@ -147,22 +173,22 @@ module icache (
         logic [`CACHE_LINE_BITS-1:0]  rd_index;  // ... from this index
         srambank_128x4x64_6t122 data_0 (
             .clk    (clock),
-            .ADDRESS(got_mem_data ? current_index : next_index),
-            .wd     (Imem2proc_data),
+            .ADDRESS(got_data ? current_index : next_index),
+            .wd     (fill_data),
             .banksel(1'b1),
-            .read   (!got_mem_data),
-            .write  (got_mem_data),
+            .read   (!got_data),
+            .write  (got_data),
             .dataout(Icache_data_out)
         );
         always_ff @(posedge clock) begin
             if (reset) rd_ok <= 0;
-            else       rd_ok <= !got_mem_data;
+            else       rd_ok <= !got_data;
             rd_index <= next_index;
         end
         assign data_ok = rd_ok && (rd_index == current_index);
     end else begin : gen_flops
         logic [63:0] lines [`CACHE_LINES];
-        always_ff @(posedge clock) if (!reset && got_mem_data) lines[current_index] <= Imem2proc_data;
+        always_ff @(posedge clock) if (!reset && got_data) lines[current_index] <= fill_data;
         assign Icache_data_out = lines[current_index];
         assign data_ok         = 1'b1;
     end
