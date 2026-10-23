@@ -84,7 +84,7 @@ module testbench;
 
     mem_arbiter dut (
         .clock, .reset,
-        .d_command, .d_addr, .d_data, .d_prefetch(1'b0), .d_response, .d_tag,
+        .d_command, .d_addr, .d_data, .d_response, .d_tag,
         .i_command, .i_addr, .i_response, .i_tag,
         .p_command, .p_addr, .p_response,
         .rdata,
@@ -151,6 +151,16 @@ module testbench;
         next_id++;
         req_valid = 0;
     endtask
+
+    // ---------------- arbiter priority ----------------
+    // an instruction prefetch is forwarded only when neither cache has a demand command
+    int n_pf_fwd = 0;
+    always @(negedge clock)
+        if (!reset && dut.p_sel) begin
+            n_pf_fwd++;
+            if (d_command != BUS_NONE || i_command != BUS_NONE)
+                fail($sformatf("a prefetch went to memory while a demand command waited (D %0d, I %0d)", d_command, i_command));
+        end
 
     // ---------------- I side: fetch process ----------------
     // decides at the falling edge, but fetch_addr changes at the rising edge, like a PC register
@@ -254,6 +264,7 @@ module testbench;
         $display("  (stream buffer: %0d prefetches issued, %0d used, %0d dropped, %0d skipped as cached, %0d cycles fetch waited for one)",
                  iprefetch_0.n_issued, iprefetch_0.n_useful, iprefetch_0.n_dropped, iprefetch_0.n_skipped, iprefetch_0.n_late);
         if (`IPF_DEPTH > 0) begin
+            if (n_pf_fwd < 1000) fail("too few prefetches reached memory to check the priority");
             if (iprefetch_0.n_useful < (`IPF_DEPTH >= 4 ? 1000 : 250 * `IPF_DEPTH)) fail("too few blocks came from the stream buffer");
             if (iprefetch_0.n_dropped < 100) fail("too few prefetches were dropped by a new miss");
             if (iprefetch_0.n_late < 100)    fail("fetch (almost) never waited for a prefetch in flight");

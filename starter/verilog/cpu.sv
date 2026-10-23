@@ -712,7 +712,6 @@ module cpu #(
       .d_command   (d_command),
       .d_addr      (d_addr),
       .d_data      (d_data),
-      .d_prefetch  (1'b0),
       .d_response  (d_response),
       .d_tag       (d_tag),
       .i_command   (i_command),

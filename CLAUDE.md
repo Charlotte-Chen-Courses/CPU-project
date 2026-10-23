@@ -48,9 +48,12 @@ The analysis IS the deliverable.
   anything new.
 - **Prefetch (added 2026-10-22, after MSHRs).** I-side: a stream buffer
   (`iprefetch.sv`, `IPF_DEPTH`, default 4; 0 = off) beside the single-port I$
-  SRAM. D-side: planned, a stream prefetcher on miss addresses using spare MSHRs.
-  Prefetches have the lowest memory priority (arbiter: D demand > I demand >
-  D prefetch > I prefetch) and a cap on requests in flight.
+  SRAM. Prefetches have the lowest memory priority (arbiter: D > I > I
+  prefetch) and a cap on requests in flight.
+  D-side: tagged prefetch was built, measured and **removed (2026-10-22)**:
+  with its own 2 MSHRs it bought +0.7% total cycles (+5.6% geomean), less
+  than spending those 2 MSHRs on demand (+1.9%). The numbers stay for the
+  write-up.
 - **F extension: one floating-point functional unit** — a second register class
   for rename and a second long/variable-latency FU class. See ISA scope.
 - **A extension (atomics)** — LR/SC + AMOs, executed through the LSQ.
