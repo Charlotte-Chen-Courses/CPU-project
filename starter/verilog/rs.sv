@@ -15,9 +15,10 @@
 //                 (rank_type in sys_defs). fu_ready backpressures a   //
 //                 port. Issued entries free at the clock edge.        //
 //                 A serial entry (CSR, later atomics) is ready only   //
-//                 when it is the oldest instruction (rob_head).       //
+//                 when it is the oldest instruction of its thread     //
+//                 (rob_head[tid]).                                    //
 //                 Known: lowest-index select can starve high slots.   //
-//                 flush clears all.                                   //
+//                 flush[t] clears thread t's entries.                 //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -43,13 +44,14 @@ module rs #(
     input [CDB_SZ-1:0]            cdb_valid,
     input [CDB_SZ-1:0][TAG_W-1:0] cdb_tag,
 
-    input flush,  // branch mispredict: squash every entry
-    input [`ROB_IDX_W-1:0] rob_head,  // oldest instruction: a serial entry issues only there
+    input [`NUM_THREADS-1:0] flush,  // mispredict in thread t: squash its entries
+    input [`NUM_THREADS-1:0][`ROB_IDX_W-1:0] rob_head,  // each thread's oldest: a serial entry issues only there
 
     // issue
     input [NUM_FU-1:0] fu_ready,
     output logic [NUM_FU-1:0] issue_valid,
-    output RS_PACKET [NUM_FU-1:0] issue_pkt
+    output RS_PACKET [NUM_FU-1:0] issue_pkt,
+    output logic [`NUM_THREADS-1:0][$clog2(RS_SZ+1)-1:0] thread_count   // entries per thread (ICOUNT fetch)
 
 );
 
@@ -91,6 +93,12 @@ module rs #(
 
   assign space_ok = ($countones(~rs_valid) >= W);
 
+  always_comb begin
+    thread_count = '0;
+    for (int e = 0; e < RS_SZ; e++)
+      if (rs_valid[e]) thread_count[rs_map[e].tid] = thread_count[rs_map[e].tid] + 1'b1;
+  end
+
   // same-cycle wakeup: a source broadcast this cycle is ready on arrival
   always_comb begin
     for (int i = 0; i < W; i++) begin
@@ -108,7 +116,7 @@ module rs #(
   always_comb begin
     for (int e = 0; e < RS_SZ; e++)
     ready[e] = rs_valid[e] && rs_map[e].src1_ready && rs_map[e].src2_ready && rs_map[e].src3_ready &&
-               (!rs_map[e].serial || rs_map[e].rob_idx == rob_head);
+               (!rs_map[e].serial || rs_map[e].rob_idx == rob_head[rs_map[e].tid]);
 
     granted     = '0;
     issue_valid = '0;
@@ -130,7 +138,7 @@ module rs #(
 
 
   always_ff @(posedge clock) begin
-    if (reset || flush) rs_valid <= '0;
+    if (reset) rs_valid <= '0;
     else begin
       for (int e = 0; e < RS_SZ; e++) begin
         if (rs_valid[e])
@@ -142,11 +150,13 @@ module rs #(
           end
       end
       for (int i = 0; i < W; i++)
-      if (disp_valid[i]) begin
+      if (disp_valid[i] && !flush[disp_pkt[i].tid]) begin   // (a dispatch in its thread's flush cycle is dropped)
         rs_map[alloc_idx[i]]   <= cdb_pkt[i];
         rs_valid[alloc_idx[i]] <= `TRUE;
       end
       for (int f = 0; f < `NUM_FU; f++) if (issue_valid[f]) rs_valid[grant_idx[f]] <= `FALSE;
+      // (only entries valid before this cycle: a slot allocated now may still hold an old tid)
+      for (int e = 0; e < RS_SZ; e++) if (rs_valid[e] && flush[rs_map[e].tid]) rs_valid[e] <= `FALSE;
     end
   end
 

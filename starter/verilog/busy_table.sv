@@ -21,7 +21,7 @@
 
 module busy_table #(
     parameter  BASE          = 0,              // first tag of this register class
-    parameter  BUSY_TABLE_SZ = `PHYS_REG_SZ,
+    parameter  BUSY_TABLE_SZ = `THREAD_PHYS_SZ,
     parameter  bit ZERO_REG  = 1'b1,           // local preg 0 (x0) is never busy
     localparam TAG_W         = `TAG_W,
     localparam W             = `SUPERSCALAR_WIDTH,

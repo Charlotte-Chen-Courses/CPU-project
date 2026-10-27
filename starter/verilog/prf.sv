@@ -38,7 +38,8 @@ module prf #(
   logic [SZ-1:0][`XLEN-1:0] registers;   // local index = tag - BASE (0 unused when ZERO_REG)
 
   function automatic bit in_file(input logic [TAG_W-1:0] t);
-    return (int'(t) >= BASE) && (int'(t) < BASE + SZ) && !(ZERO_REG && int'(t) == BASE);
+    // (every thread's x0: each thread's tag range starts with its x0 register)
+    return (int'(t) >= BASE) && (int'(t) < BASE + SZ) && !(ZERO_REG && (int'(t) - BASE) % `THREAD_PHYS_SZ == 0);
   endfunction
   function automatic logic [$clog2(SZ)-1:0] local_idx(input logic [TAG_W-1:0] t);
     return $clog2(SZ)'(int'(t) - BASE);

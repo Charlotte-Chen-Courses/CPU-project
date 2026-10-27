@@ -68,7 +68,7 @@ module testbench;
     );
 
     icache icache_0 (
-        .clock, .reset,
+        .clock, .reset, .fetch_tid('0),
         .Imem2proc_response(i_response), .Imem2proc_data(rdata), .Imem2proc_tag(i_tag),
         .proc2Icache_addr(fetch_addr), .next_addr(next_fetch),
         .proc2Imem_command(i_command), .proc2Imem_addr(i_addr),

@@ -19,6 +19,13 @@ TESTS := prf freelist rat rob rs busy_table alu_fu branch_fu mult_fu div_fu bran
 # against the FP instance (+define+FP_CLASS: tags offset by FP_TAG_BASE, f0 is a real register)
 FP_VARIANTS := rat retire_rat freelist busy_table prf
 TESTS += $(FP_VARIANTS:%=%_fp)
+# the core's test on the 2-thread core (both threads checked); and again with every flop and
+# memory starting random instead of zero (nothing may depend on state reset does not set)
+TESTS += cpu_t2 cpu_t2_xr
+# the bimodal direction predictor (BP_TYPE = 0; the default is the tournament)
+TESTS += branch_pred_bim
+BASE_branch_pred_bim  := branch_pred
+VDEFS_branch_pred_bim := +define+BP_TYPE=0
 $(foreach v,$(FP_VARIANTS),$(eval BASE_$(v)_fp := $(v))$(eval VDEFS_$(v)_fp := +define+FP_CLASS))
 
 # extra sources per module, e.g. DEPS_mult := $(SRC)/verilog/mult_stage.sv
@@ -69,6 +76,28 @@ DEPS_cpu := $(addprefix $(SRC)/verilog/, dispatch.sv decoder.sv freelist.sv rat.
 CSRC_cpu    := $(CSRC_fp_fu)
 LDFLAGS_cpu := $(LDFLAGS_fp_fu)
 CFLAGS_cpu  := $(CFLAGS_fp_fu)
+# the core with one thread's 28 KB private bound (what each thread gets with 2, below the shared
+# window): runs the SMT images alone
+BASE_cpu_b28    := cpu
+VDEFS_cpu_b28   := +define+THREAD_MEM_SZ=28672
+DEPS_cpu_b28    := $(DEPS_cpu)
+CSRC_cpu_b28    := $(CSRC_cpu)
+LDFLAGS_cpu_b28 := $(LDFLAGS_cpu)
+CFLAGS_cpu_b28  := $(CFLAGS_cpu)
+# the core with 2 hardware threads (SMT)
+BASE_cpu_t2     := cpu
+VDEFS_cpu_t2    := +define+NUM_THREADS=2
+DEPS_cpu_t2     := $(DEPS_cpu)
+CSRC_cpu_t2     := $(CSRC_cpu)
+LDFLAGS_cpu_t2  := $(LDFLAGS_cpu)
+CFLAGS_cpu_t2   := $(CFLAGS_cpu)
+BASE_cpu_t2_xr    := cpu
+VDEFS_cpu_t2_xr   := +define+NUM_THREADS=2 --x-initial unique --x-assign unique
+RUNARGS_cpu_t2_xr := +verilator+rand+reset+2
+DEPS_cpu_t2_xr    := $(DEPS_cpu)
+CSRC_cpu_t2_xr    := $(CSRC_cpu)
+LDFLAGS_cpu_t2_xr := $(LDFLAGS_cpu)
+CFLAGS_cpu_t2_xr  := $(CFLAGS_cpu)
 
 # ns. 1.53 = Design Compiler's period for the core (ASAP7, 2026-10-22), so mem.sv's 100 ns is
 # a realistic ~66 cycles. CLOCK_PERIOD=10 gives the old 10-cycle memory (faster simulations).
@@ -81,13 +110,44 @@ VERILATOR_FLAGS := --binary --timing -j 0 -Wall -Wno-fatal \
 
 HEADERS := $(wildcard $(SRC)/verilog/*.svh)
 
-.PHONY: test clean synth_local $(TESTS:%=tb_%) $(TESTS:%=lint_%)
+.PHONY: test clean synth_local smt_progs smt_solo smt_t2 smt_pairs $(TESTS:%=tb_%) $(TESTS:%=lint_%)
 
 test: $(TESTS:%=tb_%)
 
+# ---- SMT: every test program built for one thread's private memory (28 KB, base + bound; the
+# top 4 KB of the thread's 32 KB is the shared window) ----
+SMT_PROGS := $(BUILD)/smt_progs
+# programs that do not fit in 32 KB: outer_product (19 KB of arrays on the stack + a 13 KB image)
+SMT_EXCLUDE := outer_product
+smt_progs:
+	@bash $(SRC)/programs/build_images.sh $(SMT_PROGS) 28672
+	@for n in $(SMT_EXCLUDE); do rm -f $(SMT_PROGS)/$$n.mem; done
+
+# each image alone on a one-thread core with the 28 KB bound, checked against the ISS: all must
+# pass (an image that reaches beyond 28 KB raises an access exception the ISS does not expect)
+smt_solo: smt_progs $(BUILD)/cpu_b28/Vtestbench
+	@ls $(SMT_PROGS)/*.mem | xargs -P 8 -n 1 sh -c '$(abspath $(BUILD))/cpu_b28/Vtestbench +program=$$0 > $$0.log 2>&1; \
+	  grep -q "@@@ Passed" $$0.log && echo "  pass $$0" || echo "  FAIL $$0"' | sort > $(SMT_PROGS)/solo.txt
+	@grep -c pass $(SMT_PROGS)/solo.txt | xargs echo "smt_solo: passed:"; ! grep FAIL $(SMT_PROGS)/solo.txt
+
+# each image as thread 0 of the 2-thread core while thread 1 halts at once: all must pass
+smt_t2: smt_progs $(BUILD)/cpu_t2/Vtestbench
+	@ls $(SMT_PROGS)/*.mem | xargs -P 8 -n 1 sh -c '$(abspath $(BUILD))/cpu_t2/Vtestbench +program=$$0 > $$0.t2.log 2>&1; \
+	  grep -q "@@@ Passed" $$0.t2.log && echo "  pass $$0" || echo "  FAIL $$0"' | sort > $(SMT_PROGS)/t2.txt
+	@grep -c pass $(SMT_PROGS)/t2.txt | xargs echo "smt_t2: passed:"; ! grep FAIL $(SMT_PROGS)/t2.txt
+
+# two programs at once on the 2-thread core, each checked against its own ISS: program i (thread 0)
+# with program i+17 (thread 1), so every program runs once in each thread
+smt_pairs: smt_progs $(BUILD)/cpu_t2/Vtestbench
+	@ls $(SMT_PROGS)/*.mem | awk '{p[NR-1]=$$0} END {for (i = 0; i < NR; i++) print p[i], p[(i + 17) % NR]}' | \
+	  xargs -P 8 -n 2 sh -c 'n=$$(basename $$0 .mem)+$$(basename $$1 .mem); \
+	  $(abspath $(BUILD))/cpu_t2/Vtestbench +program=$$0 +program1=$$1 > $(SMT_PROGS)/$$n.pair.log 2>&1; \
+	  grep -q "@@@ Passed" $(SMT_PROGS)/$$n.pair.log && echo "  pass $$n" || echo "  FAIL $$n"' | sort > $(SMT_PROGS)/pairs.txt
+	@grep -c pass $(SMT_PROGS)/pairs.txt | xargs echo "smt_pairs: passed:"; ! grep FAIL $(SMT_PROGS)/pairs.txt
+
 # build + run one testbench; fail the make target unless it prints "@@@ Passed"
 $(TESTS:%=tb_%): tb_%: $(BUILD)/%/Vtestbench
-	@$(abspath $<) | tee $(BUILD)/$*/sim.log
+	@$(abspath $<) $(RUNARGS_$*) | tee $(BUILD)/$*/sim.log
 	@grep -q "@@@ Passed" $(BUILD)/$*/sim.log
 
 # rebuild when any source of the test changes, including its DEPS_<mod> files
