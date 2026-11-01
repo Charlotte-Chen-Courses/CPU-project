@@ -32,7 +32,13 @@
 //                 instruction, with nothing younger dispatched), so   //
 //                 fcsr is written at issue (fcsr_we) and the old      //
 //                 value goes to rd through a result register that     //
-//                 yields to CVFPU's output. flush empties everything. //
+//                 yields to CVFPU's output. flush[t] drops thread t's //
+//                 work: the input buffer and CSR result by thread; in //
+//                 CVFPU (whose flush_i empties everything) one thread //
+//                 uses flush_i, several use epochs: each thread's     //
+//                 counter steps on its flush, ops carry {tid, epoch}  //
+//                 as part of the tag, and a result from an older      //
+//                 epoch is drained without going to the CDB.          //
 //                                                                     //
 /////////////////////////////////////////////////////////////////////////
 
@@ -47,12 +53,12 @@ module fp_fu (
     output logic       out_valid,
     output CDB_PACKET  out_pkt,
     input              out_grant,
-    input              flush,
+    input  [`NUM_THREADS-1:0] flush,
 
     input [`XLEN-1:0]  rs1_value,
     input [`XLEN-1:0]  rs2_value,
     input [`XLEN-1:0]  rs3_value,
-    input [7:0]        fcsr,         // {frm, fflags}: frm for rm = DYN, all of it for CSR ops
+    input [7:0]        fcsr,         // in_pkt's thread's {frm, fflags}: frm for rm = DYN, all for CSR ops
     output logic       fcsr_we,      // a CSR op writes fcsr this cycle
     output logic [7:0] fcsr_wdata
 );
@@ -60,11 +66,21 @@ module fp_fu (
   logic [2:0] frm;
   assign frm = fcsr[7:5];
 
+  localparam EP_W = 4;                 // epochs: a result outliving 16 flushes of its thread cannot happen
+
   typedef struct packed {
     logic [`TAG_W-1:0]     tag;
     logic [`ROB_IDX_W-1:0] rob_idx;
+    logic [`TID_W-1:0]     tid;
+    logic [EP_W-1:0]       epoch;      // the thread's epoch when the op entered
     logic                  illegal;    // rm = DYN with an invalid frm
   } FP_TAG;
+
+  logic [`NUM_THREADS-1:0][EP_W-1:0] epoch;
+  always_ff @(posedge clock)
+    for (int t = 0; t < `NUM_THREADS; t++)
+      if (reset)         epoch[t] <= '0;
+      else if (flush[t]) epoch[t] <= epoch[t] + 1'b1;
 
   // one operation as CVFPU takes it
   typedef struct packed {
@@ -87,7 +103,8 @@ module fp_fu (
     req_in.rnd      = arith_rm;
     req_in.op       = fpnew_pkg::ADD;
     req_in.op_mod   = 1'b0;
-    req_in.tag      = '{tag: in_pkt.dest_tag, rob_idx: in_pkt.rob_idx, illegal: bad_dyn};
+    req_in.tag      = '{tag: in_pkt.dest_tag, rob_idx: in_pkt.rob_idx, tid: in_pkt.tid, epoch: epoch[in_pkt.tid],
+                        illegal: bad_dyn};
     case (opcode)
       7'b1000011: req_in.op = fpnew_pkg::FMADD;                                    // fmadd
       7'b1000111: begin req_in.op = fpnew_pkg::FMADD;  req_in.op_mod = 1'b1; end   // fmsub
@@ -115,7 +132,7 @@ module fp_fu (
   end
 
   // ---------------- CSR ops (fflags 0x001, frm 0x002, fcsr 0x003) ----------------
-  logic        in_csr, csr_v, fpu_out_valid;
+  logic        in_csr, csr_v, fpu_out_valid, fpu_live, stale;
   logic [7:0]  csr_old, csr_src, csr_new;
   CDB_PACKET   csr_pkt;
   assign in_csr = in_valid && (in_pkt.inst[6:0] == 7'b1110011);
@@ -134,12 +151,13 @@ module fp_fu (
   assign fcsr_we = in_csr;
 
   always_ff @(posedge clock) begin
-    if (reset || flush) csr_v <= `FALSE;
-    else if (in_csr) begin
+    if (reset) csr_v <= `FALSE;
+    else if (in_csr && !flush[in_pkt.tid]) begin
       csr_v   <= `TRUE;
-      csr_pkt <= '{tag: in_pkt.dest_tag, value: {24'b0, csr_old}, rob_idx: in_pkt.rob_idx,
+      csr_pkt <= '{tag: in_pkt.dest_tag, value: {24'b0, csr_old}, rob_idx: in_pkt.rob_idx, tid: in_pkt.tid,
                    branch: `FALSE, next_pc: '0, exception: EXC_NONE, fflags: '0};
-    end else if (csr_v && out_grant && !fpu_out_valid) csr_v <= `FALSE;
+    end else if (csr_v && flush[csr_pkt.tid]) csr_v <= `FALSE;
+    else if (csr_v && out_grant && !fpu_live) csr_v <= `FALSE;
   end
 
   // ---------------- input buffer ----------------
@@ -151,9 +169,16 @@ module fp_fu (
   assign req       = buf_v ? buf_req : req_in;
 
   always_ff @(posedge clock) begin
-    if (reset || flush)                                   buf_v <= `FALSE;
-    else if (buf_v && fpu_ready)                          buf_v <= `FALSE;
-    else if (!buf_v && in_valid && !in_csr && !fpu_ready) begin buf_v <= `TRUE; buf_req <= req_in; end
+    // An op CVFPU has seen must stay until it takes it (valid/ready): one thread can drop it on a
+    // flush, since flush_i empties CVFPU in the same cycle; with several threads it stays, and the
+    // epoch check drops its result (withdrawing it mid-handshake left the iterative div/sqrt unit
+    // computing a ghost whose result came out for the next op).
+    if (reset)                                                           buf_v <= `FALSE;
+    else if (buf_v && `NUM_THREADS == 1 && flush[buf_req.tag.tid])       buf_v <= `FALSE;
+    else if (buf_v && fpu_ready)                                         buf_v <= `FALSE;
+    else if (!buf_v && in_valid && !in_csr && !fpu_ready && (`NUM_THREADS > 1 || !flush[in_pkt.tid])) begin
+      buf_v <= `TRUE; buf_req <= req_in;
+    end
   end
 
   // ---------------- CVFPU ----------------
@@ -194,19 +219,23 @@ module fp_fu (
       .simd_mask_i   (1'b1),
       .in_valid_i    (req_valid),
       .in_ready_o    (fpu_ready),
-      .flush_i       (flush),
+      .flush_i       (`NUM_THREADS == 1 ? flush[0] : 1'b0),
       .result_o      (result),
       .status_o      (status),
       .tag_o         (out_tag),
       .out_valid_o   (fpu_out_valid),
-      .out_ready_i   (out_grant),
+      .out_ready_i   (out_grant || stale),
       .busy_o        ()
   );
   /* verilator lint_on PINCONNECTEMPTY */
 
+  // a result from before its thread's last flush is drained, never sent (one thread: flush_i did it)
+  assign stale    = `NUM_THREADS > 1 && fpu_out_valid && out_tag.epoch != epoch[out_tag.tid];
+  assign fpu_live = fpu_out_valid && !stale;
+
   // CVFPU's result first; a CSR result waits behind it (CVFPU is idle by then anyway)
-  assign out_valid = fpu_out_valid || csr_v;
-  assign out_pkt   = fpu_out_valid ? '{tag: out_tag.tag, value: result, rob_idx: out_tag.rob_idx,
+  assign out_valid = fpu_live || csr_v;
+  assign out_pkt   = fpu_live ? '{tag: out_tag.tag, value: result, rob_idx: out_tag.rob_idx, tid: out_tag.tid,
                                        branch: `FALSE, next_pc: '0,
                                        exception: out_tag.illegal ? EXC_ILLEGAL : EXC_NONE,
                                        fflags: out_tag.illegal ? 5'b0 : status}

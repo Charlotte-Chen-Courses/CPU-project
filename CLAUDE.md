@@ -38,7 +38,11 @@ The analysis IS the deliverable.
   misspeculation.
 - **Branch: BTB + tournament predictor + RAS.** (Start with a bimodal predictor
   for first-correct, then upgrade.) Measurement of prediction accuracy matters
-  more than predictor sophistication.
+  more than predictor sophistication. **Done:** `BP_TYPE` 1 (default) =
+  bimodal + gshare (`GHR_W` 8) + chooser; per-thread speculative history
+  restored from the committed one on a flush; each branch's history rides in
+  the ROB and trains the same entry (an assertion checks it equals the
+  committed history). Measured: mispredicts 12.08% -> 10.26%, 1.0% fewer cycles.
 - **Non-blocking D-cache with MSHRs** — added only once the core is solid; pairs
   with the LSQ for a memory-level-parallelism analysis story. **Implemented
   2026-10-22:** `DC_MSHRS` (default 4; 0 = blocking, the cut-order fallback) x
@@ -200,7 +204,45 @@ pre-planned fallback points so the project can never end with nothing.
   the fallback beneath it.**
 
 ### Phase 5 — SMT overlay (Week 9) — TERMINAL, CUTTABLE
-- Only start if Phase 4 is genuinely stable.
+- Only start if Phase 4 is genuinely stable. Fallback tag: `phase4-rv32imaf-mem`;
+  work on branch `smt`.
+- **Decided design:** every circular / architectural structure is duplicated
+  per thread at full size (ROB 32, LQ/SQ 8, RAT, free lists, busy tables,
+  retirement RATs, RAS, PC, fcsr), each thread on its own physical-tag range.
+  Shared: RS (entries carry a thread ID), FUs, CDBs, PRFs, caches, predictor
+  tables, load-wait table. A thread's flush kills only its work, by thread ID
+  (CVFPU: per-thread epochs; an op CVFPU has seen is never withdrawn). Memory:
+  **base + bound per thread** (decided:
+  the course .s programs hard-code data addresses, so relinking could not
+  move them). Thread t sees 0..`THREAD_MEM_SZ`-1 (32 KB with 2 threads) at
+  physical t*`THREAD_MEM_SZ`; fetch and the D-cache port add the base, the
+  LSQ / fetch check the bound. One build per program (`make smt_progs`,
+  28 KB); `make smt_solo` runs each alone on a 28 KB-bound core. outer_product
+  does not fit (19 KB of stack arrays) and is excluded. **Shared window
+  (decided):** with several threads the top 4 KB of every thread's 32 KB
+  (virtual 0x7000-0x7FFF) is one shared physical region; programs keep 28 KB
+  private. Shared-data atomics: an AMO holds the D-cache port from its read to
+  its write, another thread's store into the window clears a matching LR
+  reservation, cancels an SC to that word not yet written, and replays a
+  load that already read it. Tests check invariants (counters, lock) and a
+  same-address load-order litmus (Tests 56-60). Mutants: the reservation snoop
+  and the load replay are caught; the AMO port lock and the SC recheck are not,
+  because atomics are already serialized across threads (the RS's store-port
+  ready is the AND of every LSQ's, and a busy atomic engine is not ready). They
+  stay as defence in depth for a per-thread store-port ready.
+- **Stages (each with a gate):** S1 `NUM_THREADS` plumbing, cycle-identical at
+  1 thread on all 49 programs (passed); S2 base + bound, 32 KB images that pass
+  alone (passed); S3 2-thread hardware with thread 1 halted, existing tests
+  pass (passed: `make tb_cpu_t2`, `make smt_t2`); S4 passed: per-thread ISS
+  contexts, random pairs + directed tests, `make smt_pairs`, random-init run
+  (`cpu_t2_xr`); S5 passed: thread-hashed I-cache, D-cache, BTB/BHT/LWT
+  indexes and ICOUNT fetch (`FETCH_POLICY`; pairs 0.98x -> 1.11x vs. running
+  one after the other; round-robin 1.12x); S4 two live threads, directed tests, then benchmark pairs whose
+  per-thread commit traces equal solo runs; S5 round-robin then ICOUNT fetch;
+  S6 measurements. S3 added: per-thread I-cache miss state
+  (another thread's fill can evict a waiting block: it misses again), one
+  stream buffer per thread, every thread's x0 tag reads 0 in the PRF,
+  round-robin fetch and commit (commit only among ready ROB heads).
 - Thread-tag / duplicate architectural state: 2× RAT, 2× RAS, per-thread PC, ROB
   thread-ID + per-thread commit, per-thread isolated recovery.
 - Build a real fetch policy (**ICOUNT**, not round-robin) — where SMT's

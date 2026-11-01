@@ -25,18 +25,51 @@
 // max instructions issued per cycle (RS -> PRF read); PRF has 2 read ports per issue slot
 `define ISSUE_WIDTH `SUPERSCALAR_WIDTH
 
+// hardware threads (SMT). Each thread has its own ROB, LQ/SQ, rename tables, free lists, busy
+// tables, retirement tables, RAS, PC and fcsr, and its own range of physical register tags;
+// the RS, functional units, CDBs, PRFs, caches and predictor tables are shared.
+`ifndef NUM_THREADS     // (build variants may set it: cpu_t2)
+`define NUM_THREADS 1
+`endif
+`define TID_W ((`NUM_THREADS > 1) ? $clog2(`NUM_THREADS) : 1)
+// Base + bound: each thread sees addresses 0 .. THREAD_MEM_SZ-1 (PCs, loads, stores; every program
+// is built for that size), placed at t*THREAD_MEM_SZ in physical memory. Fetch and the D-cache
+// port add the base; an access beyond the bound is EXC_ACCESS. One thread: base 0, the whole memory.
+`ifndef THREAD_MEM_SZ   // (build variants may set it, e.g. a one-thread core with a 28 KB bound)
+`define THREAD_MEM_SZ (`MEM_SIZE_IN_BYTES / `NUM_THREADS)
+`endif
+// Shared window (several threads only): the top SHARED_SZ bytes of every thread's addresses are one
+// shared physical region, at the same physical address (thread 0's top). Programs keep their own data
+// and stack below PRIV_MEM_SZ.
+`define SHARED_SZ   ((`NUM_THREADS > 1) ? 4096 : 0)
+`define PRIV_MEM_SZ (`THREAD_MEM_SZ - `SHARED_SZ)
+// fetch policy with several threads: 0 = round-robin; 1 = ICOUNT (Tullsen 1996): the thread with the
+// fewest RS entries, skipping threads whose I-cache miss is in memory
+`ifndef FETCH_POLICY
+`define FETCH_POLICY 1
+`endif
+// with several threads, XOR the thread number into the top D-cache set-index bits (each thread's data
+// sits at the same addresses in its own part of memory, so unhashed they compete for the same sets)
+`ifndef DC_THREAD_HASH
+`define DC_THREAD_HASH 1
+`endif
+
 // sizes
 `define NUM_CDB 2
 
 `define RS_SZ 16
 `define ARCH_REG_SZ 32
-`define ROB_SZ 32
-`define PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)          // integer physical registers: tags 0..
-`define FREE_LIST_SZ (`PHYS_REG_SZ - `ARCH_REG_SZ)
+`define ROB_SZ 32                                      // per thread
+// integer physical registers: thread t owns tags t*THREAD_PHYS_SZ .. (its architectural state plus
+// one rename register per ROB entry); PHYS_REG_SZ is the total
+`define THREAD_PHYS_SZ (`ARCH_REG_SZ + `ROB_SZ)
+`define PHYS_REG_SZ (`NUM_THREADS * `THREAD_PHYS_SZ)
+`define FREE_LIST_SZ (`THREAD_PHYS_SZ - `ARCH_REG_SZ)  // per thread
 // FP physical registers are a separate class with their own RAT/freelist/PRF/busy table; their
 // tags follow the integer ones (FP_TAG_BASE..), so one tag names a register of either class
-`define FP_PHYS_REG_SZ (`ARCH_REG_SZ + `ROB_SZ)
-`define FP_FREE_LIST_SZ (`FP_PHYS_REG_SZ - `ARCH_REG_SZ)
+`define FP_THREAD_PHYS_SZ (`ARCH_REG_SZ + `ROB_SZ)
+`define FP_PHYS_REG_SZ (`NUM_THREADS * `FP_THREAD_PHYS_SZ)
+`define FP_FREE_LIST_SZ (`FP_THREAD_PHYS_SZ - `ARCH_REG_SZ)  // per thread
 `define FP_TAG_BASE `PHYS_REG_SZ
 `define TAG_W $clog2(`PHYS_REG_SZ + `FP_PHYS_REG_SZ)
 `define ROB_IDX_W $clog2(`ROB_SZ)
@@ -47,6 +80,15 @@
 // branch predictor (fetch): BTB entries and bimodal 2-bit counters (powers of 2)
 `define BTB_SZ 32
 `define BHT_SZ 256
+// direction predictor: 0 = bimodal (BHT); 1 = tournament (as in the Alpha 21264, simplified): the
+// bimodal BHT, a gshare table (PC XOR global history) and a per-PC chooser between them. Global
+// history is per thread: speculative at fetch, restored from the committed copy on a flush.
+`ifndef BP_TYPE
+`define BP_TYPE 1
+`endif
+`define GHR_W      8      // global history bits (per thread)
+`define PHT_SZ     256    // gshare counters (power of 2)
+`define CHOOSER_SZ 256    // chooser counters (power of 2)
 `define RAS_SZ 8      // return address stack depth (power of 2)
 // load / store queues (powers of 2)
 `define LQ_SZ 8
@@ -473,6 +515,7 @@ typedef struct packed {
   logic [`XLEN-1:0]  pc;          // commit trace / mispredict redirect
   logic              halt;        // WFI: stop at commit
   logic [`XLEN-1:0]  pred_npc;    // next PC fetch predicted (set at dispatch)
+  logic [`GHR_W-1:0] hist;        // global history it was predicted with (trains the same gshare entry)
   logic [`XLEN-1:0]  next_pc;     // actual next PC: PC+4 at dispatch, branches overwrite at complete
   EXCEPTION          exception;   // reported at commit
   logic              is_br;       // conditional branch, jal or jalr: trains the predictor at commit
@@ -505,6 +548,7 @@ typedef struct packed {
   logic                  serial;       // issue only as the oldest instruction (ROB head)
   logic [`TAG_W-1:0]     dest_tag;
   logic [`ROB_IDX_W-1:0] rob_idx;
+  logic [`TID_W-1:0]     tid;          // hardware thread (rob_idx is in that thread's ROB)
   FU_TYPE                fu_type;
 
 
@@ -524,6 +568,7 @@ typedef struct packed {
   logic [`TAG_W-1:0]     tag;      // dest_tag (p0 = no destination)
   logic [`XLEN-1:0]      value;
   logic [`ROB_IDX_W-1:0] rob_idx;
+  logic [`TID_W-1:0]     tid;      // hardware thread
   logic                  branch;   // result of a branch/jump: next_pc is valid
   logic [`XLEN-1:0]      next_pc;  // actual next PC (branches only)
   EXCEPTION              exception;  // raised by this instruction (misaligned target/address,

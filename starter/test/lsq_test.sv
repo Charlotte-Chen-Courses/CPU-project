@@ -67,6 +67,10 @@ module testbench;
     logic [`DMEM_ID_W-1:0]          dmem_req_id, dmem_resp_id;
     logic                           stores_pending, viol_valid, ld_wait;
     logic [`ROB_IDX_W-1:0]          viol_rob_idx;
+    // (SMT: no other thread here, so no other thread's stores to snoop)
+    logic                           snoop_valid = 1'b0, snoop_viol_valid, amo_lock;
+    logic [`XLEN-1:0]               snoop_addr = '0;
+    logic [`ROB_IDX_W-1:0]          snoop_viol_rob_idx;
 
     lsq dut (.*);
 

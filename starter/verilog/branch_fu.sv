@@ -29,7 +29,7 @@ module branch_fu (
     output logic      out_valid,
     output CDB_PACKET out_pkt,
     input             out_grant,
-    input             flush,      // mispredict: drop any result (it belongs to a squashed instr)
+    input  [`NUM_THREADS-1:0] flush,  // mispredict in thread t: drop its results (squashed instrs)
 
     input [`XLEN-1:0] rs1_value,  // operands read from the PRF
     input [`XLEN-1:0] rs2_value
@@ -73,16 +73,17 @@ module branch_fu (
   assign ready = !out_valid || out_grant;
 
   always_ff @(posedge clock) begin
-    if (reset || flush) out_valid <= `FALSE;
+    if (reset) out_valid <= `FALSE;
     else if (ready) begin
-      out_valid <= in_valid;
+      out_valid <= in_valid && !flush[in_pkt.tid];
       if (in_valid)
-        out_pkt <= '{tag: in_pkt.dest_tag, value: link, rob_idx: in_pkt.rob_idx,
+        out_pkt <= '{tag: in_pkt.dest_tag, value: link, rob_idx: in_pkt.rob_idx, tid: in_pkt.tid,
                      branch: `TRUE, next_pc: next_pc,
                      exception: (next_pc[1:0] != 2'b00) ? EXC_MISALIGNED : EXC_NONE,   // no C extension
                      fflags: '0};
     end
-    // else: holding a result that lost arbitration — keep it
+    // else: holding a result that lost arbitration — keep it, unless its thread flushes
+    else if (flush[out_pkt.tid]) out_valid <= `FALSE;
   end
 
 endmodule  // branch_fu

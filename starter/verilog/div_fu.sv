@@ -30,7 +30,7 @@ module div_fu (
     output logic      out_valid,
     output CDB_PACKET out_pkt,
     input             out_grant,
-    input             flush,
+    input  [`NUM_THREADS-1:0] flush,
 
     input [`XLEN-1:0] rs1_value,
     input [`XLEN-1:0] rs2_value
@@ -44,6 +44,7 @@ module div_fu (
   logic                  want_rem, neg_q, neg_r, div_zero;
   logic [`TAG_W-1:0]     tag;
   logic [`ROB_IDX_W-1:0] rob_idx;
+  logic [`TID_W-1:0]     tid;
 
   // one restoring step
   logic [32:0] rem_sh;
@@ -66,7 +67,7 @@ module div_fu (
   assign ready = !busy && (!out_valid || out_grant);
 
   always_ff @(posedge clock) begin
-    if (reset || flush) begin
+    if (reset) begin
       busy      <= `FALSE;
       out_valid <= `FALSE;
     end else begin
@@ -80,11 +81,11 @@ module div_fu (
           // out_valid is always 0 here: a new op only starts once the previous result has
           // left (ready), so a finished result never has to wait for the output register
           out_valid <= `TRUE;
-          out_pkt   <= '{tag: tag, value: want_rem ? r_fix : q_fix, rob_idx: rob_idx,
+          out_pkt   <= '{tag: tag, value: want_rem ? r_fix : q_fix, rob_idx: rob_idx, tid: tid,
                          branch: `FALSE, next_pc: '0, exception: EXC_NONE, fflags: '0};
           busy      <= `FALSE;
         end
-      end else if (in_valid && ready) begin   // never start over a result still waiting for the CDB
+      end else if (in_valid && ready && !flush[in_pkt.tid]) begin   // never start over a result still waiting for the CDB
         busy     <= `TRUE;
         cnt      <= 6'd32;
         rem      <= '0;
@@ -96,7 +97,15 @@ module div_fu (
         div_zero <= (rs2_value == '0);
         tag      <= in_pkt.dest_tag;
         rob_idx  <= in_pkt.rob_idx;
+        tid      <= in_pkt.tid;
       end
+      // a flush of the operation's thread abandons it (and the result it would finish this cycle);
+      // one of the waiting result's thread drops that (busy and out_valid are never both set)
+      if (busy && flush[tid]) begin
+        busy      <= `FALSE;
+        out_valid <= `FALSE;
+      end
+      if (out_valid && flush[out_pkt.tid]) out_valid <= `FALSE;
     end
   end
 

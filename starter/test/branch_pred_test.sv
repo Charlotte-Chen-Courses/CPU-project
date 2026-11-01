@@ -2,7 +2,8 @@
 //                                                                     //
 //   Modulename :  branch_pred_test.sv                                 //
 //                                                                     //
-//  Description :  Testbench for the BTB + bimodal predictor. The      //
+//  Description :  Testbench for the BTB + bimodal (or, BP_TYPE = 1,   //
+//                 tournament: + gshare and chooser) predictor. The    //
 //                 model keeps its own BTB and counter tables and      //
 //                 applies updates one slot at a time in program       //
 //                 order. Every cycle checks btb_hit / pred_taken /    //
@@ -28,11 +29,13 @@ module testbench;
     logic [W-1:0][31:0]      lookup_pc, pred_target, upd_pc, upd_target;
     logic [W-1:0]            pred_taken, btb_hit, upd_valid, upd_uncond, upd_taken;
     logic [W-1:0]            pred_call, pred_ret, upd_call, upd_ret;
+    logic [W-1:0][`GHR_W-1:0] lookup_hist, upd_hist;
 
     branch_pred dut (
         .clock      (clock),
         .reset      (reset),
         .lookup_pc  (lookup_pc),
+        .lookup_hist(lookup_hist),
         .pred_taken (pred_taken),
         .pred_target(pred_target),
         .btb_hit    (btb_hit),
@@ -44,7 +47,8 @@ module testbench;
         .upd_call   (upd_call),
         .upd_ret    (upd_ret),
         .upd_taken  (upd_taken),
-        .upd_target (upd_target)
+        .upd_target (upd_target),
+        .upd_hist   (upd_hist)
     );
 
     always #5 clock = ~clock;
@@ -57,10 +61,22 @@ module testbench;
     logic [31:0] m_pc     [BTB_SZ];   // full PC of the branch that owns the entry
     logic [31:0] m_target [BTB_SZ];
     int          m_cnt    [BHT_SZ];
+    int          m_pht    [`PHT_SZ];      // (tournament)
+    int          m_ch     [`CHOOSER_SZ];
     int errors = 0, n_hits = 0, n_checks = 0;
 
     function automatic int bi(input logic [31:0] pc); return (pc >> 2) % BTB_SZ; endfunction
     function automatic int ci(input logic [31:0] pc); return (pc >> 2) % BHT_SZ; endfunction
+    function automatic int pi(input logic [31:0] pc, input logic [`GHR_W-1:0] h);
+        return (((pc >> 2) % `PHT_SZ) ^ (int'(h) % `PHT_SZ));
+    endfunction
+    function automatic int hi(input logic [31:0] pc); return (pc >> 2) % `CHOOSER_SZ; endfunction
+    function automatic int sat(input int c, input bit up); return up ? ((c == 3) ? 3 : c + 1) : ((c == 0) ? 0 : c - 1); endfunction
+    // direction the model predicts for pc looked up with history h
+    function automatic bit m_dir(input logic [31:0] pc, input logic [`GHR_W-1:0] h);
+        if (`BP_TYPE == 1 && m_ch[hi(pc)] >= 2) return m_pht[pi(pc, h)] >= 2;
+        return m_cnt[ci(pc)] >= 2;
+    endfunction
 
     task automatic fail(input string msg);
         $display("  FAIL: %s", msg);
@@ -70,10 +86,13 @@ module testbench;
     task automatic model_reset();
         foreach (m_valid[e]) m_valid[e] = 0;
         foreach (m_cnt[c]) m_cnt[c] = 1;
+        foreach (m_pht[c]) m_pht[c] = 1;
+        foreach (m_ch[c]) m_ch[c] = 1;
     endtask
 
     task automatic idle();
         lookup_pc = '0; upd_valid = '0; upd_pc = '0; upd_uncond = '0; upd_taken = '0; upd_target = '0;
+        lookup_hist = '0; upd_hist = '0;
         upd_call = '0; upd_ret = '0;
     endtask
 
@@ -87,7 +106,7 @@ module testbench;
         for (int i = 0; i < W; i++) begin
             automatic int  e   = bi(lookup_pc[i]);
             automatic bit  hit = m_valid[e] && m_pc[e] == lookup_pc[i];
-            automatic bit  tk  = hit && (m_uncond[e] || m_cnt[ci(lookup_pc[i])] >= 2);
+            automatic bit  tk  = hit && (m_uncond[e] || m_dir(lookup_pc[i], lookup_hist[i]));
             n_checks++;
             if (btb_hit[i] !== hit)
                 fail($sformatf("[%s] slot %0d pc %h: btb_hit=%b expected %b", what, i, lookup_pc[i], btb_hit[i], hit));
@@ -105,9 +124,13 @@ module testbench;
         for (int i = 0; i < W; i++)          // program order
             if (upd_valid[i]) begin
                 if (!upd_uncond[i]) begin
-                    automatic int c = ci(upd_pc[i]);
-                    m_cnt[c] = upd_taken[i] ? ((m_cnt[c] == 3) ? 3 : m_cnt[c] + 1)
-                                            : ((m_cnt[c] == 0) ? 0 : m_cnt[c] - 1);
+                    automatic int c = ci(upd_pc[i]), p = pi(upd_pc[i], upd_hist[i]), h = hi(upd_pc[i]);
+                    if (`BP_TYPE == 1) begin
+                        // the chooser moves toward gshare when the two disagree and gshare was right
+                        if ((m_cnt[c] >= 2) != (m_pht[p] >= 2)) m_ch[h] = sat(m_ch[h], (m_pht[p] >= 2) == upd_taken[i]);
+                        m_pht[p] = sat(m_pht[p], upd_taken[i]);
+                    end
+                    m_cnt[c] = sat(m_cnt[c], upd_taken[i]);
                 end
                 if (upd_taken[i]) begin
                     automatic int e = bi(upd_pc[i]);
@@ -124,6 +147,7 @@ module testbench;
     localparam logic [31:0] C = A + 4 * BHT_SZ;
     logic [31:0] pool [] = '{A, B, C, A + 4, A + 8, 32'h0000_2000, 32'h0000_2004, 32'h0001_0040};
 
+    logic [`GHR_W-1:0] hpool [4] = '{'0, `GHR_W'(1), `GHR_W'('h55), '1};
     function automatic logic [31:0] any_pc();
         return pool[$urandom_range(0, pool.size() - 1)];
     endfunction
@@ -164,16 +188,28 @@ module testbench;
             idle(); lookup_pc[0] = A; lookup_pc[1] = C; step("check chained counter");
         end
 
+        if (`BP_TYPE == 1) begin
+            $display("Test 5b: an alternating branch: bimodal cannot learn it, gshare with history can");
+            for (int n = 0; n < 40; n++) begin      // T, N, T, N ... with history = last outcome
+                idle(); upd(0, A, 0, n % 2 == 0, 32'h0000_0400); upd_hist[0] = `GHR_W'((n + 1) % 2); step("alternate");
+            end
+            idle(); lookup_pc[0] = A; lookup_hist[0] = `GHR_W'(1); if (W > 1) begin lookup_pc[1] = A; lookup_hist[1] = '0; end
+            step("predict both phases");
+            if (!pred_taken[0] || (W > 1 && pred_taken[1])) fail("tournament did not learn the alternating branch");
+        end
+
         $display("Test 6: 20000 random cycles");
         for (int c = 0; c < 20000; c++) begin
             idle();
             for (int i = 0; i < W; i++) begin
                 lookup_pc[i] = any_pc();
+                lookup_hist[i] = hpool[$urandom_range(0, 3)];
                 if ($urandom % 2 == 1) begin
                     automatic bit unc = ($urandom % 4 == 0);
                     automatic bit tk  = unc || ($urandom % 3 != 0);
                     automatic int kind = $urandom_range(0, 2);
                     upd(i, any_pc(), unc, tk, $urandom & 32'hffff_fffc);
+                    upd_hist[i] = hpool[$urandom_range(0, 3)];
                     upd_call[i] = unc && kind == 1;
                     upd_ret[i]  = unc && kind == 2;
                 end

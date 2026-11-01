@@ -29,7 +29,7 @@ module mult_fu (
     output logic      out_valid,
     output CDB_PACKET out_pkt,
     input             out_grant,
-    input             flush,
+    input  [`NUM_THREADS-1:0] flush,
 
     input [`XLEN-1:0] rs1_value,
     input [`XLEN-1:0] rs2_value
@@ -39,6 +39,7 @@ module mult_fu (
   typedef struct packed {
     logic [`TAG_W-1:0]     tag;
     logic [`ROB_IDX_W-1:0] rob_idx;
+    logic [`TID_W-1:0]     tid;
     logic                  high;     // result = product[63:32] (mulh*), else [31:0]
   } MULT_META;
 
@@ -73,19 +74,26 @@ module mult_fu (
   );
   /* verilator lint_on PINCONNECTEMPTY */
 
+  // a stage whose thread flushes is emptied (the operation keeps moving, its result is never valid)
+  logic [N-1:0] keep;
+  always_comb
+    for (int k = 0; k < N; k++) keep[k] = v[k] && !flush[meta[k].tid];
+
   always_ff @(posedge clock) begin
-    if (reset || flush) begin
+    if (reset) begin
       v <= '0;
     end else if (!stall) begin
-      v    <= {v[N-2:0], in_valid};
-      meta <= {meta[N-2:0], MULT_META'{tag: in_pkt.dest_tag, rob_idx: in_pkt.rob_idx,
+      v    <= {keep[N-2:0], in_valid && !flush[in_pkt.tid]};
+      meta <= {meta[N-2:0], MULT_META'{tag: in_pkt.dest_tag, rob_idx: in_pkt.rob_idx, tid: in_pkt.tid,
                                        high: in_pkt.alu_func != ALU_MUL}};
+    end else begin
+      v <= keep;
     end
   end
 
   assign out_pkt = '{tag: meta[N-1].tag,
                      value: meta[N-1].high ? product[63:32] : product[31:0],
-                     rob_idx: meta[N-1].rob_idx,
+                     rob_idx: meta[N-1].rob_idx, tid: meta[N-1].tid,
                      branch: `FALSE, next_pc: '0, exception: EXC_NONE, fflags: '0};
 
 endmodule  // mult_fu

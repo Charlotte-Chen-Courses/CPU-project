@@ -150,10 +150,19 @@ module dcache #(
 
   // ---------------- helpers ----------------
   /* verilator lint_off UNUSEDSIGNAL */
-  function automatic logic [IDX_W-1:0] idx_of(input logic [A_W-1:0] a); return a[IDX_W+2:3]; endfunction
+  // Set index: with several threads (DC_THREAD_HASH), the top index bits XOR the thread number, which
+  // is in the tag's top bits (the physical address bits above THREAD_MEM_SZ); so the tag still names
+  // the block, and a line's address is {tag, set ^ hmask(tag)}.
+  function automatic logic [IDX_W-1:0] hmask(input logic [TAG_W-1:0] tag);
+    automatic logic [IDX_W-1:0] m = '0;
+    if (`NUM_THREADS > 1 && `DC_THREAD_HASH != 0)
+      m[IDX_W-1 -: `TID_W] = `TID_W'(tag >> ($clog2(`THREAD_MEM_SZ) - IDX_W - 3));
+    return m;
+  endfunction
   function automatic logic [TAG_W-1:0] tag_of(input logic [A_W-1:0] a); return a[A_W-1:IDX_W+3]; endfunction
-  function automatic logic [IDX_W-1:0] bidx(input logic [BLK_W-1:0] b); return b[IDX_W-1:0]; endfunction
+  function automatic logic [IDX_W-1:0] idx_of(input logic [A_W-1:0] a); return a[IDX_W+2:3] ^ hmask(tag_of(a)); endfunction
   function automatic logic [TAG_W-1:0] btag(input logic [BLK_W-1:0] b); return b[BLK_W-1:IDX_W]; endfunction
+  function automatic logic [IDX_W-1:0] bidx(input logic [BLK_W-1:0] b); return b[IDX_W-1:0] ^ hmask(btag(b)); endfunction
   /* verilator lint_on UNUSEDSIGNAL */
 
   // write a store's bytes into a block
@@ -252,7 +261,9 @@ module dcache #(
     mem_command = BUS_NONE;
     mem_addr    = '0;
     mem_data    = '0;
-    if (wb_valid) begin
+    if (reset) begin
+      // nothing during reset (before the first edge the state is not reset yet: no stray writeback)
+    end else if (wb_valid) begin
       mem_command = BUS_STORE;
       mem_addr    = `XLEN'({wb_blk, 3'b000});
       mem_data    = wb_data;
@@ -364,7 +375,7 @@ module dcache #(
           lines[r_idx][r_victim].dirty <= `FALSE;
           if (lines[r_idx][r_victim].valid && lines[r_idx][r_victim].dirty) begin
             wb_valid <= `TRUE;
-            wb_blk   <= {lines[r_idx][r_victim].tag, r_idx};
+            wb_blk   <= {lines[r_idx][r_victim].tag, r_idx ^ hmask(lines[r_idx][r_victim].tag)};
             wb_data  <= lines[r_idx][r_victim].data;
           end
         end

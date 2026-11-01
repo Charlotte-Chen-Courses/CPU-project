@@ -82,7 +82,7 @@ module testbench;
             if (out_valid && out_grant) begin void'(q.pop_front()); n_results++; end
             if (in_valid && ready) begin
                 q.push_back('{tag: in_pkt.dest_tag, value: model(in_pkt.alu_func, rs1_value, rs2_value),
-                              rob_idx: in_pkt.rob_idx, branch: 0, next_pc: '0, exception: EXC_NONE, fflags: '0});
+                              rob_idx: in_pkt.rob_idx, tid: in_pkt.tid, branch: 0, next_pc: '0, exception: EXC_NONE, fflags: '0});
                 n_issued++;
             end
         end

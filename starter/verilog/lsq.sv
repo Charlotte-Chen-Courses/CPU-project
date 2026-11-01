@@ -68,6 +68,7 @@
 `include "verilog/ISA.svh"
 
 module lsq #(
+    parameter  TID   = 0,                      // the hardware thread this LSQ serves (one LSQ per thread)
     localparam W     = `SUPERSCALAR_WIDTH,
     localparam LQ_SZ = `LQ_SZ,
     localparam SQ_SZ = `SQ_SZ,
@@ -128,7 +129,17 @@ module lsq #(
     // memory-order violation: a store got its address and an overlapping younger load had
     // already read memory (or forwarded): the oldest such load must be re-run (ROB replay)
     output logic                        viol_valid,
-    output logic [`ROB_IDX_W-1:0]       viol_rob_idx
+    output logic [`ROB_IDX_W-1:0]       viol_rob_idx,
+
+    // SMT, shared memory: another thread's store accepted to this word (an address in the shared
+    // window, the same in every thread). It clears a reservation on it and cancels an SC to it not yet
+    // written, and an uncommitted load that already read it must be re-run (same-address loads stay
+    // in order: the younger can't keep the old value while the older gets the new one).
+    input                               snoop_valid,
+    input        [`XLEN-1:0]            snoop_addr,
+    output logic                        snoop_viol_valid,
+    output logic [`ROB_IDX_W-1:0]       snoop_viol_rob_idx,
+    output logic                        amo_lock         // an AMO between its read and its write: keep the port
 );
 
   typedef struct packed {
@@ -162,7 +173,14 @@ module lsq #(
   SQ_ENTRY sq [SQ_SZ];
   logic [LQP:0] lq_head, lq_tail;          // one extra wrap bit
   logic [SQP:0] sq_head, sq_cmt, sq_tail;
-  logic [ID_W-1:0] next_id;
+  logic [ID_W-1:0] next_id, cur_id;
+  // with several threads the top bits of a memory request id name the thread, so the LSQs sharing
+  // the D-cache never match each other's responses
+  if (`NUM_THREADS > 1) begin : gen_tid_id
+    assign cur_id = {`TID_W'(TID), next_id[ID_W-`TID_W-1:0]};
+  end else begin : gen_plain_id
+    assign cur_id = next_id;
+  end
 
   // ---------------- helpers ----------------
   function automatic int nbytes(input MEM_SIZE s);
@@ -179,7 +197,7 @@ module lsq #(
 
   function automatic EXCEPTION addr_check(input logic [`XLEN-1:0] a, input MEM_SIZE s);
     if ((s == HALF && a[0]) || (s == WORD && a[1:0] != 2'b00) || s == DOUBLE) return EXC_MISALIGNED;
-    if (a >= `MEM_SIZE_IN_BYTES) return EXC_ACCESS;   // aligned, so the whole access is in range
+    if (a >= `THREAD_MEM_SZ) return EXC_ACCESS;   // (the thread's bound) aligned, so the whole access is in range
     return EXC_NONE;
   endfunction
 
@@ -217,6 +235,7 @@ module lsq #(
   EXCEPTION              at_exc;
   logic                  resv_v;           // LR reservation
   logic [`XLEN-1:2]      resv_word;
+  logic                  at_scv;           // the SC still holds its reservation (another thread's store cancels it)
   logic                  st_is_amo, at_start;
 
   // ---------------- address generation ----------------
@@ -295,11 +314,11 @@ module lsq #(
     end
     dmem_req_valid = req_is_load || stores_pending;
     dmem_req_store = !req_is_load;
-    dmem_req_id    = next_id;
+    dmem_req_id    = cur_id;
     if (at_state == AT_READ || at_state == AT_WRITE) begin
       // (nothing else is in flight: the atomic is the oldest instruction and stores have drained)
       req_is_load    = `FALSE;
-      dmem_req_valid = `TRUE;
+      dmem_req_valid = !(at_state == AT_WRITE && at_f5 == 5'b00011 && !at_scv);   // (a cancelled SC writes nothing)
       dmem_req_store = (at_state == AT_WRITE);
       dmem_req_addr  = at_addr;
       dmem_req_size  = WORD;
@@ -359,6 +378,21 @@ module lsq #(
     end
   end
 
+  // ---------------- another thread's store (shared window) ----------------
+  assign amo_lock = (at_state == AT_WAIT || at_state == AT_WRITE) && at_f5 != 5'b00010 && at_f5 != 5'b00011;
+  always_comb begin
+    snoop_viol_valid   = `FALSE;
+    snoop_viol_rob_idx = '0;
+    for (int o = LQ_SZ - 1; o >= 0; o--) begin                  // ends on the oldest load that read the word
+      automatic int j = (int'(lq_head[LQP-1:0]) + o) % LQ_SZ;
+      if (snoop_valid && lq_valid[j] && lq[j].addr_v && (lq[j].issued || lq[j].done) &&
+          lq[j].addr[`XLEN-1:2] == snoop_addr[`XLEN-1:2]) begin
+        snoop_viol_valid   = `TRUE;
+        snoop_viol_rob_idx = lq[j].rob_idx;
+      end
+    end
+  end
+
   // ---------------- commit counts ----------------
   logic [LQP:0] lq_head_next;
   logic [SQP:0] sq_cmt_next;
@@ -375,6 +409,7 @@ module lsq #(
       st_out_valid <= `FALSE;
       at_state     <= AT_IDLE;
       resv_v       <= `FALSE;
+      at_scv       <= `FALSE;
     end else begin
       // ---- atomic engine ----
       case (at_state)
@@ -392,40 +427,48 @@ module lsq #(
           if (at_f5 == 5'b00011) begin                             // sc.w
             resv_v <= `FALSE;
             if (resv_v && resv_word == at_addr[`XLEN-1:2]) begin
-              at_wdata <= at_src; at_result <= '0; at_state <= AT_WRITE;
+              at_wdata <= at_src; at_result <= '0; at_state <= AT_WRITE; at_scv <= `TRUE;
             end else begin
               at_result <= 1; at_state <= AT_DONE;
             end
           end else at_state <= AT_READ;                              // lr.w, AMOs
         end
         AT_READ: if (dmem_req_ready) begin
-          at_id    <= next_id;
+          at_id    <= cur_id;
           next_id  <= next_id + 1'b1;
           at_state <= AT_WAIT;
+          if (at_f5 == 5'b00010) begin                             // lr.w: reserved from the read on
+            resv_v    <= `TRUE;
+            resv_word <= at_addr[`XLEN-1:2];
+          end
         end
         AT_WAIT: if (dmem_resp_valid && dmem_resp_id == at_id) begin
           at_result <= dmem_resp_data;
           if (at_f5 == 5'b00010) begin                             // lr.w
-            resv_v    <= `TRUE;
-            resv_word <= at_addr[`XLEN-1:2];
             at_state  <= AT_DONE;
           end else begin
             at_wdata <= amo_op(at_f5, dmem_resp_data, at_src);
             at_state <= AT_WRITE;
           end
         end
-        AT_WRITE: if (dmem_req_ready) at_state <= AT_DONE;
+        AT_WRITE:
+          if (at_f5 == 5'b00011 && !at_scv) begin at_result <= 1; at_state <= AT_DONE; end   // SC cancelled
+          else if (dmem_req_ready) at_state <= AT_DONE;
         default: if (!st_out_valid || st_out_grant) at_state <= AT_IDLE;   // AT_DONE: result goes out below
       endcase
       // reservation: any store written to the reserved word clears it (after an LR sets it above)
       if (dmem_req_valid && dmem_req_ready && dmem_req_store && dmem_req_addr[`XLEN-1:2] == resv_word)
         resv_v <= `FALSE;
+      if (snoop_valid) begin
+        if (snoop_addr[`XLEN-1:2] == resv_word)          resv_v <= `FALSE;
+        if (snoop_addr[`XLEN-1:2] == at_addr[`XLEN-1:2]) at_scv <= `FALSE;
+      end
 
       // memory request accepted
       if (dmem_req_valid && dmem_req_ready && at_state != AT_READ && at_state != AT_WRITE) begin
         if (req_is_load) begin
           lq[req_lq].issued <= `TRUE;
-          lq[req_lq].req_id <= next_id;
+          lq[req_lq].req_id <= cur_id;
           next_id           <= next_id + 1'b1;
         end else begin
           sq_head <= sq_head + 1'b1;
@@ -453,7 +496,7 @@ module lsq #(
       if (ld_out_valid && ld_out_grant) ld_out_valid <= `FALSE;
       if ((!ld_out_valid || ld_out_grant) && out_pick_v) begin
         ld_out_valid <= `TRUE;
-        ld_out_pkt   <= '{tag: lq[out_pick].tag, value: lq[out_pick].value, rob_idx: lq[out_pick].rob_idx,
+        ld_out_pkt   <= '{tag: lq[out_pick].tag, value: lq[out_pick].value, rob_idx: lq[out_pick].rob_idx, tid: `TID_W'(TID),
                           branch: `FALSE, next_pc: '0, exception: lq[out_pick].exc, fflags: '0};
         lq[out_pick].bcast <= `TRUE;
       end
@@ -462,7 +505,7 @@ module lsq #(
       if (st_out_valid && st_out_grant) st_out_valid <= `FALSE;
       if (at_state == AT_DONE && (!st_out_valid || st_out_grant)) begin
         st_out_valid <= `TRUE;
-        st_out_pkt   <= '{tag: at_tag, value: at_result, rob_idx: at_rob,
+        st_out_pkt   <= '{tag: at_tag, value: at_result, rob_idx: at_rob, tid: `TID_W'(TID),
                           branch: `FALSE, next_pc: '0, exception: at_exc, fflags: '0};
       end
 
@@ -487,7 +530,7 @@ module lsq #(
           automatic EXCEPTION       x = addr_check(st_addr, st_size);
           sq[k] <= '{addr_v: `TRUE, addr: st_addr, size: st_size, data: st_rs2, exc: x};
           st_out_valid <= `TRUE;
-          st_out_pkt   <= '{tag: st_in_pkt.dest_tag, value: '0, rob_idx: st_in_pkt.rob_idx,
+          st_out_pkt   <= '{tag: st_in_pkt.dest_tag, value: '0, rob_idx: st_in_pkt.rob_idx, tid: `TID_W'(TID),
                             branch: `FALSE, next_pc: '0, exception: x, fflags: '0};
         end
         // allocation (dispatch is blocked in a flush cycle anyway)

@@ -56,6 +56,7 @@ module rob #(
     input [W-1:0][`XLEN-1:0] disp_pc,
     input [W-1:0] disp_halt,  // WFI
     input [W-1:0][`XLEN-1:0] disp_pred_npc,  // next PC fetch predicted
+    input [W-1:0][`GHR_W-1:0] disp_hist,     // global history it was predicted with
     input EXCEPTION [W-1:0] disp_exception,  // != EXC_NONE: entry is done at dispatch
     input [W-1:0] disp_is_br,  // branch / jump
     input [W-1:0] disp_uncond,  // jal / jalr
@@ -94,6 +95,7 @@ module rob #(
     output logic [W-1:0] commit_is_load,  // committing a load / store (no exception): LSQ
     output logic [W-1:0] commit_is_store,
     output logic [W-1:0][`XLEN-1:0] commit_next_pc,  // its actual next PC
+    output logic [W-1:0][`GHR_W-1:0] commit_hist,    // the history it was predicted with
     output logic [W-1:0] commit_halt,  // this slot commits a halt; no younger slot commits
     output EXCEPTION [W-1:0] commit_exception,  // this slot raises an exception: it does not write
                                                 // its destination; nothing younger commits; no flush
@@ -104,6 +106,9 @@ module rob #(
     output logic [W-1:0] commit_dest_fp,  // the slot's tag/told are FP pregs
     output logic [W-1:0][4:0] commit_fflags,  // flags to accumulate (0 unless it commits cleanly)
     output logic [PTR_W-1:0] head,  // index of the oldest entry (serialized ops issue only there)
+    input        replay2_valid,     // a second replay request (SMT: another thread's store to a word a load read)
+    input [PTR_W-1:0] replay2_rob_idx,
+    output logic head_ready,        // the oldest entry can commit (or replay) if allowed (SMT commit choice)
     output logic empty
 );
   ROB_PACKET rob_map[ROB_SZ];
@@ -147,6 +152,7 @@ module rob #(
       commit_is_store[i] = commit_valid[i] && rob_map[commit_idx].is_store
                         && rob_map[commit_idx].exception == EXC_NONE;
       commit_next_pc[i] = rob_map[commit_idx].next_pc;
+      commit_hist[i] = rob_map[commit_idx].hist;
       commit_halt[i] = commit_valid[i] && rob_map[commit_idx].halt;
       if (commit_valid[i] && rob_map[commit_idx].exception == EXC_NONE
           && rob_map[commit_idx].next_pc != rob_map[commit_idx].pred_npc) begin
@@ -179,6 +185,7 @@ module rob #(
   assign space_ok = (int'(rob_count) <= ROB_SZ - W);
   assign head     = head_ptr;
   assign empty    = (rob_count == 0);
+  assign head_ready = (rob_count != 0) && (rob_map[head_ptr].done || rob_map[head_ptr].replay);
 
   // ---- sequential: next cycle's state ----
   always_ff @(posedge clock) begin
@@ -198,6 +205,7 @@ module rob #(
             pc: disp_pc[i],
             halt: disp_halt[i],
             pred_npc: disp_pred_npc[i],
+            hist: disp_hist[i],
             next_pc: disp_pc[i] + 4,  // non-branches; branches overwrite at complete
             exception: disp_exception[i],
             is_br: disp_is_br[i],
@@ -221,6 +229,7 @@ module rob #(
       end
 
       if (replay_valid && !flush) rob_map[replay_rob_idx].replay <= `TRUE;
+      if (replay2_valid && !flush) rob_map[replay2_rob_idx].replay <= `TRUE;
 
       for (int cdb_idx = 0; cdb_idx < CDB_SZ; cdb_idx++)
       if (cdb_valid[cdb_idx]) begin

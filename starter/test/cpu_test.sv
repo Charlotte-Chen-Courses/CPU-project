@@ -44,6 +44,8 @@ module testbench;
     localparam W     = `SUPERSCALAR_WIDTH;
     localparam TAG_W = `TAG_W;
     localparam MAXN  = `MEM_SIZE_IN_BYTES / 4;   // a loaded image can fill memory
+    localparam int NT  = `NUM_THREADS;
+    localparam int T1W = `THREAD_MEM_SZ / 4;      // word index where thread 1's part of memory starts
     localparam logic [31:0] WFI = 32'h10500073;
 
     logic                        clock, reset;
@@ -55,6 +57,7 @@ module testbench;
     logic [W-1:0][4:0]           commit_rd;
     logic [W-1:0][TAG_W-1:0]     commit_tag;
     logic [W-1:0][`XLEN-1:0]     commit_pc;
+    logic [`TID_W-1:0]           commit_tid;
     logic                        halted;
     EXCEPTION                    exception;
     logic [`XLEN-1:0]            exception_pc;
@@ -74,6 +77,7 @@ module testbench;
         .commit_rd        (commit_rd),
         .commit_tag       (commit_tag),
         .commit_pc        (commit_pc),
+        .commit_tid       (commit_tid),
         .halted           (halted),
         .exception        (exception),
         .exception_pc     (exception_pc),
@@ -98,8 +102,12 @@ module testbench;
     int          prog_len;
 
     // memory past the program reads as 0 (an illegal instruction)
+    // thread 0's program is imem[0 .. prog_len-1]; with more threads, thread 1's is imem[T1W ..] (its whole part)
+    logic [7:0]  t1_init [`THREAD_MEM_SZ];        // thread 1's part of memory: program + data (default: a WFI)
     function automatic logic [31:0] prog_word(input int idx);
-        return (idx >= 0 && idx < prog_len) ? imem[idx] : 32'h0;
+        if (idx >= 0 && idx < prog_len) return imem[idx];
+        if (NT > 1 && idx >= T1W && idx < 2 * T1W) return imem[idx];
+        return 32'h0;
     endfunction
 
     // ---- encoders ----
@@ -139,7 +147,8 @@ module testbench;
         return {imm[11:5], 5'(rs2), 5'(rs1), f3, imm[4:0], 7'b0100011};
     endfunction
 
-    localparam int DBASE = 'h8000;          // data region (x28 points here); code lives below
+    localparam int DBASE = `THREAD_MEM_SZ / 2;   // data region (x28 points here); code lives below
+                                                 // (0x8000 with one thread; within thread 0's part with more)
     localparam int DREG  = 28;              // base register: never written by generated code
 
     // a load or store into the 64-byte data window, naturally aligned
@@ -266,6 +275,36 @@ module testbench;
     longint      iss_ld = 0, iss_st = 0;
     longint      iss_branches;
 
+    // SMT: one ISS context per thread. The ISS runs on iss_* for thread iss_cur; iss_switch saves
+    // it and loads another. A thread's addresses are virtual: iss_base is where its part starts.
+    int          iss_base = 0, iss_cur = 0;
+    logic [31:0] ctx_pc [NT];
+    logic [31:0] ctx_reg [NT][32], ctx_freg [NT][32];
+    logic [2:0]  ctx_frm [NT];
+    logic [4:0]  ctx_fflags [NT];
+    bit          ctx_resv_v [NT];
+    logic [31:2] ctx_resv_word [NT];
+    // the ISS's physical address of the current thread's address a: the shared window (several threads)
+    // is the same for every thread, and an access there is flagged: the other thread changes it, so the
+    // monitor takes the core's value for whatever reads it (iss_shared)
+    bit iss_shared = 0;
+    function automatic int iss_pa(input int a);
+        if (NT > 1 && a >= `PRIV_MEM_SZ) begin iss_shared = 1; return a; end
+        return iss_base + a;
+    endfunction
+
+    function automatic void iss_switch(input int t);
+        if (t == iss_cur) return;
+        ctx_pc[iss_cur] = iss_pc; ctx_reg[iss_cur] = iss_reg; ctx_freg[iss_cur] = iss_freg;
+        ctx_frm[iss_cur] = iss_frm; ctx_fflags[iss_cur] = iss_fflags;
+        ctx_resv_v[iss_cur] = iss_resv_v; ctx_resv_word[iss_cur] = iss_resv_word;
+        iss_cur = t;
+        iss_base = t * `THREAD_MEM_SZ;
+        iss_pc = ctx_pc[t]; iss_reg = ctx_reg[t]; iss_freg = ctx_freg[t];
+        iss_frm = ctx_frm[t]; iss_fflags = ctx_fflags[t];
+        iss_resv_v = ctx_resv_v[t]; iss_resv_word = ctx_resv_word[t];
+    endfunction
+
     // execute the instruction at iss_pc. Returns 0 normally, 1 for WFI (or past the program),
     // 2 for an exception (exc = cause; nothing is written, the PC does not advance)
     localparam int ISS_OK = 0, ISS_WFI = 1, ISS_EXC = 2;
@@ -299,7 +338,7 @@ module testbench;
     endfunction
     function automatic int iss_step(output int rd, output bit writes, output logic [31:0] value,
                                     output EXCEPTION exc);
-        logic [31:0] i  = (iss_pc < `MEM_SIZE_IN_BYTES) ? prog_word(int'(iss_pc >> 2)) : 32'h0;
+        logic [31:0] i  = (iss_pc < `THREAD_MEM_SZ) ? prog_word((iss_base + int'(iss_pc)) >> 2) : 32'h0;
         logic [31:0] a  = iss_reg[i[19:15]];
         logic [31:0] b  = iss_reg[i[24:20]];
         logic [31:0] im = {{20{i[31]}}, i[31:20]};
@@ -310,7 +349,7 @@ module testbench;
         writes = 1;
         value  = 'x;
         exc    = EXC_NONE;
-        if (iss_pc >= `MEM_SIZE_IN_BYTES) begin   // fetch outside memory
+        if (iss_pc >= `THREAD_MEM_SZ) begin   // fetch outside the thread's memory
             writes = 0; exc = EXC_ACCESS; return ISS_EXC;
         end
         if (i == WFI) begin
@@ -338,8 +377,8 @@ module testbench;
                 (f5 == 5'b00010 && i[24:20] != 0)) begin writes = 0; exc = EXC_ILLEGAL; return ISS_EXC; end
             if (`A_EXTENSION == 0)              begin writes = 0; exc = EXC_UNSUPPORTED; return ISS_EXC; end
             if (a[1:0] != 0)                    begin writes = 0; exc = EXC_MISALIGNED;  return ISS_EXC; end
-            if (a >= `MEM_SIZE_IN_BYTES)        begin writes = 0; exc = EXC_ACCESS;      return ISS_EXC; end
-            for (int k = 0; k < 4; k++) old[8 * k +: 8] = iss_mem[int'(a) + k];
+            if (a >= `THREAD_MEM_SZ)            begin writes = 0; exc = EXC_ACCESS;      return ISS_EXC; end
+            for (int k = 0; k < 4; k++) old[8 * k +: 8] = iss_mem[iss_pa(int'(a) + k)];
             case (f5)
                 5'b00010: begin value = old; iss_resv_v = 1; iss_resv_word = a[31:2]; end   // lr.w
                 5'b00011: begin                                                           // sc.w
@@ -363,7 +402,7 @@ module testbench;
                 end
             endcase
             if (wr) begin
-                for (int k = 0; k < 4; k++) iss_mem[int'(a) + k] = nw[8 * k +: 8];
+                for (int k = 0; k < 4; k++) iss_mem[iss_pa(int'(a) + k)] = nw[8 * k +: 8];
                 if (iss_resv_v && a[31:2] == iss_resv_word) iss_resv_v = 0;
             end
             if (rd == 0) writes = 0;
@@ -406,13 +445,13 @@ module testbench;
                 automatic bit          st   = (i[6:0] == 7'b0100111);
                 automatic logic [31:0] addr = st ? a + {{20{i[31]}}, i[31:25], i[11:7]} : a + im;
                 if (addr[1:0] != 0)             begin writes = 0; exc = EXC_MISALIGNED; return ISS_EXC; end
-                if (addr >= `MEM_SIZE_IN_BYTES) begin writes = 0; exc = EXC_ACCESS;     return ISS_EXC; end
+                if (addr >= `THREAD_MEM_SZ) begin writes = 0; exc = EXC_ACCESS;     return ISS_EXC; end
                 if (st) begin
-                    for (int k = 0; k < 4; k++) iss_mem[int'(addr) + k] = iss_freg[i[24:20]][8 * k +: 8];
+                    for (int k = 0; k < 4; k++) iss_mem[iss_pa(int'(addr) + k)] = iss_freg[i[24:20]][8 * k +: 8];
                     if (iss_resv_v && addr[31:2] == iss_resv_word) iss_resv_v = 0;
                     writes = 0; iss_st++;
                 end else begin
-                    for (int k = 0; k < 4; k++) value[8 * k +: 8] = iss_mem[int'(addr) + k];
+                    for (int k = 0; k < 4; k++) value[8 * k +: 8] = iss_mem[iss_pa(int'(addr) + k)];
                     iss_freg[rd] = value; iss_wfp = 1; iss_ld++;
                 end
             end else begin
@@ -441,13 +480,13 @@ module testbench;
                 writes = 0; exc = EXC_ILLEGAL; return ISS_EXC;
             end
             if ((n == 2 && addr[0]) || (n == 4 && addr[1:0] != 0)) begin writes = 0; exc = EXC_MISALIGNED; return ISS_EXC; end
-            if (addr >= `MEM_SIZE_IN_BYTES)                       begin writes = 0; exc = EXC_ACCESS;     return ISS_EXC; end
+            if (addr >= `THREAD_MEM_SZ)                           begin writes = 0; exc = EXC_ACCESS;     return ISS_EXC; end
             if (st) begin
-                for (int k = 0; k < n; k++) iss_mem[int'(addr) + k] = b[8 * k +: 8];
+                for (int k = 0; k < n; k++) iss_mem[iss_pa(int'(addr) + k)] = b[8 * k +: 8];
                 if (iss_resv_v && addr[31:2] == iss_resv_word) iss_resv_v = 0;
                 writes = 0; iss_st++;
             end else begin
-                for (int k = 0; k < n; k++) raw[8 * k +: 8] = iss_mem[int'(addr) + k];
+                for (int k = 0; k < n; k++) raw[8 * k +: 8] = iss_mem[iss_pa(int'(addr) + k)];
                 value = (n == 4) ? raw : i[14] ? raw & ((1 << (8 * n)) - 1)
                                                : (n == 1 ? {{24{raw[7]}}, raw[7:0]} : {{16{raw[15]}}, raw[15:0]});
                 iss_ld++;
@@ -536,24 +575,40 @@ module testbench;
         iss_frm = 0; iss_fflags = 0; iss_wfp = 0; iss_resv_v = 0;
         iss_pc = 0;
         iss_mem = init_mem;
+        // every thread starts the same way (at its address 0)
+        iss_cur = 0; iss_base = 0;
+        for (int t = 0; t < NT; t++) begin
+            ctx_pc[t] = iss_pc; ctx_reg[t] = iss_reg; ctx_freg[t] = iss_freg; ctx_frm[t] = iss_frm;
+            ctx_fflags[t] = iss_fflags; ctx_resv_v[t] = iss_resv_v; ctx_resv_word[t] = iss_resv_word;
+        end
     endfunction
 
-    // dynamic length of the program (the ISS run to the WFI or exception), and how it ends
-    EXCEPTION    end_exc;
-    logic [31:0] end_pc;
+    // dynamic length of each thread's program (the ISS run to its WFI or exception), and how it
+    // ends (end_exc / end_pc: thread 0's); returns the total
+    EXCEPTION    end_exc, end_exc_t [NT];
+    logic [31:0] end_pc, end_pc_t [NT];
+    int          expect_t [NT];
     function automatic int iss_count();
-        int rd, n = 0;
+        int rd, total = 0;
         bit writes;
         logic [31:0] value;
         EXCEPTION e;
         iss_reset();
-        while (iss_step(rd, writes, value, e) == ISS_OK) begin
-            n++;
-            if (n > 50000000) $fatal(1, "ISS: program does not terminate");
+        for (int t = 0; t < NT; t++) begin
+            automatic int n = 0;
+            iss_switch(t);
+            while (iss_step(rd, writes, value, e) == ISS_OK) begin
+                n++;
+                if (n > 50000000) $fatal(1, "ISS: program does not terminate");
+            end
+            end_exc_t[t] = e;
+            end_pc_t[t]  = iss_pc;
+            expect_t[t]  = n + 1;   // + the WFI / excepting instruction
+            total += n + 1;
         end
-        end_exc = e;
-        end_pc  = iss_pc;
-        return n + 1;   // + the WFI / excepting instruction
+        end_exc = end_exc_t[0];
+        end_pc  = end_pc_t[0];
+        return total;
     endfunction
 
     // an instruction the core must never execute: only placed where control flow skips it, so
@@ -612,6 +667,60 @@ module testbench;
         foreach (fx_site[k]) imem[fx_site[k]] = enc_jal(1, 4 * (fn[fx_func[k]] - fx_site[k]));
         fx_site.delete();
         fx_func.delete();
+    endtask
+
+    // a program working on the shared window (several threads): n times
+    //  kind 0: amoadd.w of 1 to the counter at 0x7000;
+    //  kind 1: LR / SC increment of 0x7004, retried until the SC succeeds;
+    //  kind 2: take the spinlock at 0x7008 (amoswap), plain lw / addi / sw of 0x700c, release it;
+    //  kind 3: same-address load order (reader): the older load of 0x7010 gets its address late (a
+    //          divide), the younger one at once; if the younger ever sees an older value than the
+    //          older one, set the flag at 0x7014;
+    //  kind 4: writer for kind 3: stores 1, 2, 3, ... to 0x7010.
+    // A random amount of unrelated work (x10..x15) in each loop varies how the threads meet.
+    task automatic shared_prog(input int kind, input int n);
+        int top;
+        start_program();
+        emit(enc_u(7'b0110111, 30, 20'h7));                    // x30 = 0x7000: the shared window
+        emit(enc_i(3'b000, 5, 0, 12'd1));                      // x5 = 1
+        emit(enc_i(3'b000, 9, 0, 12'd1));                      // x9 = 1 (lock taken)
+        emit(enc_i(3'b000, 7, 0, 12'(n)));                     // x7 = n
+        emit(enc_i(3'b000, 31, 30, 12'(kind == 1 ? 4 : kind == 2 ? 8 : 16)));   // x31 = the word
+        emit(enc_i(3'b000, 6, 0, 12'd0));                      // x6 = 0
+        top = prog_len;
+        case (kind)
+            0: emit(enc_amo(5'b00000, 0, 30, 5));              // amoadd.w x0, x5, (x30)
+            1: begin
+                automatic int retry = prog_len;
+                emit(enc_amo(5'b00010, 6, 31, 0));             // retry: lr.w x6, (x31)
+                emit(enc_i(3'b000, 6, 6, 12'd1));
+                emit(enc_amo(5'b00011, 8, 31, 6));             // sc.w x8, x6, (x31)
+                emit(enc_b(3'b001, 8, 0, 4 * (retry - prog_len)));   // bnez x8, retry
+            end
+            2: begin
+                automatic int acq = prog_len;
+                emit(enc_amo(5'b00001, 8, 31, 9));             // acquire: amoswap.w x8, x9, (x31)
+                emit(enc_b(3'b001, 8, 0, 4 * (acq - prog_len)));     // bnez x8, acquire
+                emit(enc_load(3'b010, 6, 31, 12'd4));          // lw x6, 4(x31): the counter at 0x700c
+                emit(enc_i(3'b000, 6, 6, 12'd1));
+                emit(enc_store(3'b010, 6, 31, 12'd4));         // sw x6, 4(x31)
+                emit(enc_amo(5'b00001, 0, 31, 0));             // release: amoswap.w x0, x0, (x31)
+            end
+            3: begin
+                emit(enc_r(7'b0000001, 3'b101, 11, 31, 5));    // x11 = x31 / 1 (the address, late)
+                emit(enc_load(3'b010, 12, 11, 12'd0));         // older:   lw x12, 0(x11)
+                emit(enc_load(3'b010, 13, 31, 12'd0));         // younger: lw x13, 0(x31)
+                emit(enc_b(3'b111, 13, 12, 8));                // bgeu x13, x12, +8: in order
+                emit(enc_store(3'b010, 5, 31, 12'd4));         //   out of order: flag (0x7014) = 1
+            end
+            default: begin
+                emit(enc_i(3'b000, 6, 6, 12'd1));              // x6++
+                emit(enc_store(3'b010, 6, 31, 12'd0));         // sw x6, 0(x31)
+            end
+        endcase
+        repeat ($urandom_range(0, 6)) emit(rand_alu(32, 10, 15));
+        emit(enc_i(3'b000, 7, 7, -12'd1));
+        emit(enc_b(3'b001, 7, 0, 4 * (top - prog_len)));      // bnez x7, top
     endtask
 
     // prologue: give every register x1..x31 a defined, random value (lui + addi)
@@ -734,35 +843,60 @@ module testbench;
         errors++;
     endtask
 
-    // after a halt nothing is in flight: every tag is either free or in the retirement map
+    // per-thread rename state, copied out of the generate blocks (a task cannot index them by a variable)
+    int                free_count_t    [NT], fp_free_count_t [NT];
+    logic [TAG_W-1:0]  freelist_mem_t  [NT][`FREE_LIST_SZ];
+    logic [TAG_W-1:0]  fp_freelist_mem_t [NT][`FP_FREE_LIST_SZ];
+    for (genvar t = 0; t < NT; t++) begin : gen_thread_probe
+        always_comb begin
+            free_count_t[t]    = int'(dut.dispatch_0.gen_thread[t].freelist_0.free_count);
+            fp_free_count_t[t] = int'(dut.dispatch_0.gen_thread[t].fp_freelist_0.free_count);
+            for (int i = 0; i < `FREE_LIST_SZ; i++)    freelist_mem_t[t][i]    = dut.dispatch_0.gen_thread[t].freelist_0.freelist_mem[i];
+            for (int i = 0; i < `FP_FREE_LIST_SZ; i++) fp_freelist_mem_t[t][i] = dut.dispatch_0.gen_thread[t].fp_freelist_0.freelist_mem[i];
+        end
+    end
+
+    // after a halt nothing is in flight: in every thread, every one of its tags is either free or in
+    // its retirement map, exactly once (x0's tag in neither)
     task automatic check_tags(input string name);
-        int count [`PHYS_REG_SZ];
-        int fl_sz = `FREE_LIST_SZ;
-        foreach (count[t]) count[t] = 0;
-        if (int'(dut.dispatch_0.freelist_0.free_count) != fl_sz)
-            fail($sformatf("[%s] free list holds %0d tags after halt, expected %0d", name,
-                           dut.dispatch_0.freelist_0.free_count, fl_sz));
-        for (int r = 1; r < 32; r++) count[dut.retire_map[r]]++;
-        for (int i = 0; i < fl_sz; i++) count[dut.dispatch_0.freelist_0.freelist_mem[i]]++;
-        for (int t = 1; t < `PHYS_REG_SZ; t++)
-            if (count[t] != 1) fail($sformatf("[%s] p%0d appears %0d times (retirement map + free list)",
-                                              name, t, count[t]));
-        if (count[0] != 0) fail($sformatf("[%s] p0 is in the retirement map or free list", name));
-        // the FP class: every FP preg (f0's initial one included) is mapped or free, exactly once
-        begin
-            automatic int fcount [`FP_PHYS_REG_SZ];
-            automatic int ffl = `FP_FREE_LIST_SZ;
+        for (int th = 0; th < NT; th++) begin
+            automatic int ibase = th * `THREAD_PHYS_SZ, fbase = `FP_TAG_BASE + th * `FP_THREAD_PHYS_SZ;
+            automatic int count [`THREAD_PHYS_SZ];
+            automatic int fcount [`FP_THREAD_PHYS_SZ];
+            foreach (count[t]) count[t] = 0;
             foreach (fcount[t]) fcount[t] = 0;
-            if (int'(dut.dispatch_0.fp_freelist_0.free_count) != ffl)
-                fail($sformatf("[%s] FP free list holds %0d tags after halt, expected %0d", name,
-                               dut.dispatch_0.fp_freelist_0.free_count, ffl));
-            for (int r = 0; r < 32; r++) fcount[int'(dut.fp_retire_map[r]) - `FP_TAG_BASE]++;
-            for (int i = 0; i < ffl; i++) fcount[int'(dut.dispatch_0.fp_freelist_0.freelist_mem[i]) - `FP_TAG_BASE]++;
-            for (int t = 0; t < `FP_PHYS_REG_SZ; t++)
-                if (fcount[t] != 1) fail($sformatf("[%s] FP preg %0d appears %0d times (retirement map + free list)",
-                                                   name, t, fcount[t]));
+            if (free_count_t[th] != `FREE_LIST_SZ)
+                fail($sformatf("[%s] thread %0d: free list holds %0d tags after halt, expected %0d", name, th,
+                               free_count_t[th], `FREE_LIST_SZ));
+            for (int r = 1; r < 32; r++) count[int'(dut.retire_map[th][r]) - ibase]++;
+            for (int i = 0; i < `FREE_LIST_SZ; i++) count[int'(freelist_mem_t[th][i]) - ibase]++;
+            for (int t = 1; t < `THREAD_PHYS_SZ; t++)
+                if (count[t] != 1) fail($sformatf("[%s] thread %0d: p%0d appears %0d times (retirement map + free list)",
+                                                  name, th, ibase + t, count[t]));
+            if (count[0] != 0) fail($sformatf("[%s] thread %0d: its x0 tag is in the retirement map or free list", name, th));
+            // the FP class: every FP preg (f0's initial one included) is mapped or free, exactly once
+            if (fp_free_count_t[th] != `FP_FREE_LIST_SZ)
+                fail($sformatf("[%s] thread %0d: FP free list holds %0d tags after halt, expected %0d", name, th,
+                               fp_free_count_t[th], `FP_FREE_LIST_SZ));
+            for (int r = 0; r < 32; r++) fcount[int'(dut.fp_retire_map[th][r]) - fbase]++;
+            for (int i = 0; i < `FP_FREE_LIST_SZ; i++) fcount[int'(fp_freelist_mem_t[th][i]) - fbase]++;
+            for (int t = 0; t < `FP_THREAD_PHYS_SZ; t++)
+                if (fcount[t] != 1) fail($sformatf("[%s] thread %0d: FP preg %0d appears %0d times (retirement map + free list)",
+                                                   name, th, fbase + t, fcount[t]));
         end
     endtask
+
+    // a word of memory as it stands: mem.sv, or a dirty D-cache block holding it
+    function automatic logic [31:0] mem_word(input int a);
+        localparam int SETS = `DC_SZ / (`DC_BLK * `DC_WAYS);
+        automatic logic [63:0] blk = memory.unified_memory[a / 8];
+        for (int st = 0; st < SETS; st++)
+            for (int w = 0; w < `DC_WAYS; w++)
+                if (dut.dcache_0.lines[st][w].valid && dut.dcache_0.lines[st][w].dirty &&
+                    (int'(dut.dcache_0.lines[st][w].tag) * SETS + int'(st ^ dut.dcache_0.hmask(dut.dcache_0.lines[st][w].tag))) == a / 8)
+                    blk = dut.dcache_0.lines[st][w].data;
+        return (a % 8 >= 4) ? blk[63:32] : blk[31:0];
+    endfunction
 
     task automatic check_memory(input string name);
         automatic int nbad = 0;
@@ -773,21 +907,45 @@ module testbench;
         for (int st = 0; st < SETS; st++)
             for (int w = 0; w < `DC_WAYS; w++)
                 if (dut.dcache_0.lines[st][w].valid && dut.dcache_0.lines[st][w].dirty) begin
-                    automatic int base = (int'(dut.dcache_0.lines[st][w].tag) * SETS + st) * 8;
+                    // (the set index may be thread-hashed: undo it, as the D-cache does for a writeback)
+                    automatic int base = (int'(dut.dcache_0.lines[st][w].tag) * SETS +
+                                          int'(st ^ dut.dcache_0.hmask(dut.dcache_0.lines[st][w].tag))) * 8;
                     for (int b = 0; b < 8; b++) actual[base + b] = dut.dcache_0.lines[st][w].data[8 * b +: 8];
                 end
         for (int a = 0; a < `MEM_SIZE_IN_BYTES; a++)
-            if (actual[a] !== iss_mem[a]) begin
+            if (!(NT > 1 && a >= `PRIV_MEM_SZ && a < `THREAD_MEM_SZ) &&   // (shared window: checked by the tests)
+                actual[a] !== iss_mem[a]) begin
                 if (nbad < 4) fail($sformatf("[%s] memory byte %h = %h, expected %h", name, a, actual[a], iss_mem[a]));
                 nbad++;
             end
     endtask
 
     string prog_file;
-    int    trace_fd = 0;    // +trace=<file>: one line per committed instruction (pc, rd, value)
+    bit    shared_test = 0;   // the threads interact through the shared window: no instruction counts
+    int    trace_fd_t [NT];  // +trace=<file> (thread 0), +trace1=<file>: one line per committed instruction (pc, rd, value)
+
+    // thread 1's program: idle (a WFI at its address 0), or the program just generated in imem, which
+    // is finished (WFI + functions) and moved there with its own random data region
+    task automatic set_thread1_wfi();
+        foreach (t1_init[a]) t1_init[a] = 8'h0;
+        for (int k = 0; k < 4; k++) t1_init[k] = WFI[8 * k +: 8];
+    endtask
+    task automatic move_to_thread1();
+        emit(WFI);
+        emit_functions();
+        for (int a = 0; a < `THREAD_MEM_SZ; a += 4) begin
+            automatic logic [31:0] w = prog_word(a / 4);
+            for (int k = 0; k < 4; k++)
+                t1_init[a + k] = (a >= DBASE && a < DBASE + 'h2000) ? 8'($urandom) : w[8 * k +: 8];
+        end
+        prog_len = 0;
+    endtask
 
     task automatic run_program(input string name, input bit from_file = 0);
         int cycles = 0, committed = 0, rd, flushes = 0, how, ret_misp = 0, replays = 0;
+        int committed_t [NT];
+        bit done_t [NT];
+        bit wrote_x [NT][32], wrote_f [NT][32];   // registers a thread wrote (others have no defined value)
         bit writes, done = 0;
         EXCEPTION e;
         logic [31:0] value;
@@ -796,18 +954,23 @@ module testbench;
         if (!from_file) begin                 // (a loaded image is already in init_mem and imem)
             emit(WFI);
             emit_functions();                 // after the WFI: reached only through calls
-            // memory image: the program, zeros, and random data at 0x8000..0x9fff
-            for (int a = 0; a < `MEM_SIZE_IN_BYTES; a += 4) begin
+            // memory image: the program, zeros, and random data at DBASE..DBASE+0x1fff (thread 0's part)
+            for (int a = 0; a < `THREAD_MEM_SZ; a += 4) begin
                 automatic logic [31:0] w = prog_word(a / 4);
                 for (int k = 0; k < 4; k++)
                     init_mem[a + k] = (a >= DBASE && a < DBASE + 'h2000) ? 8'($urandom) : w[8 * k +: 8];
             end
         end
+        // thread 1's part (t1_init: by default a WFI) in memory and, as words, in imem for its ISS
+        if (NT > 1) begin
+            for (int a = 0; a < `THREAD_MEM_SZ; a++) init_mem[`THREAD_MEM_SZ + a] = t1_init[a];
+            for (int k = 0; k < T1W; k++) imem[T1W + k] = {t1_init[4 * k + 3], t1_init[4 * k + 2], t1_init[4 * k + 1], t1_init[4 * k]};
+        end
         iss_ld = 0; iss_st = 0;
         iss_branches = 0;
         expect_n = iss_count();
         iss_m = 0; iss_f = 0; iss_csr = 0; iss_amo = 0;
-        limit = 60 * expect_n + 2000;
+        limit = shared_test ? 2000000 : 60 * expect_n + 2000;   // (threads that wait for each other: no count)
         iss_reset();
         iss_branches = 0;
 
@@ -821,11 +984,13 @@ module testbench;
         @(negedge clock);
         reset = 0;
 
+        foreach (done_t[t]) begin done_t[t] = 0; committed_t[t] = 0; end
+        foreach (wrote_x[t, r]) begin wrote_x[t][r] = 0; wrote_f[t][r] = 0; end
         while (!done) begin
             @(negedge clock);
             cycles++;
-            if (!dut.fetch_stop && dut.pc_in_range && !dut.icache_valid) total_istall++;
-            total_fwd += $countones(dut.lsq_0.can_fwd);
+            if (!dut.fetch_stop[dut.fetch_tid] && dut.pc_in_range && !dut.icache_valid) total_istall++;
+            total_fwd += $countones(dut.gen_lsq[0].lsq_0.can_fwd);
             if (`NUM_FU_FP > 0) begin
                 fp_issue    += int'(dut.issue_valid[FPP]);
                 fp_blocked  += int'(!dut.fu_ready[FPP]);
@@ -841,7 +1006,7 @@ module testbench;
                         break;
                     end
             end
-            if (!dut.fire && !dut.fetch_stop && !dut.flush) begin
+            if (!dut.fire && !dut.fetch_stop[dut.fetch_tid] && !dut.flush) begin
                 if (!dut.rob_space_ok)              stall_rob++;
                 if (!dut.rs_space_ok)               stall_rs++;
                 if (!dut.dispatch_0.can_alloc_w)    stall_freelist++;
@@ -849,20 +1014,40 @@ module testbench;
             end
             for (int i = 0; i < W; i++) begin
                 if (!commit_valid[i]) continue;
-                if (done) begin
-                    fail($sformatf("[%s] slot %0d committed PC %h after the WFI", name, i, commit_pc[i]));
+                iss_switch(int'(commit_tid));     // the committing thread's ISS
+                if (done_t[commit_tid]) begin
+                    fail($sformatf("[%s] thread %0d slot %0d committed PC %h after its WFI", name, commit_tid, i, commit_pc[i]));
                     continue;
                 end
                 if (commit_pc[i] !== iss_pc)
-                    fail($sformatf("[%s] commit %0d: PC %h, expected %h", name, committed, commit_pc[i], iss_pc));
+                    fail($sformatf("[%s] thread %0d commit %0d: PC %h, expected %h", name, commit_tid,
+                                   committed_t[commit_tid], commit_pc[i], iss_pc));
+                iss_shared = 0;
                 how = iss_step(rd, writes, value, e);
                 committed++;
-                if (trace_fd != 0) $fdisplay(trace_fd, "%h %s%0d %h", commit_pc[i], iss_wfp ? "f" : "x",
-                                             writes ? rd : 0, writes ? value : 32'h0);
+                committed_t[commit_tid]++;
+                if (iss_shared && writes && commit_dest_valid[i]) begin
+                    // it read the shared window: the value is the core's (the other thread writes there too)
+                    value = iss_wfp ? dut.fp_prf_0.registers[int'(commit_tag[i]) - `FP_TAG_BASE]
+                                    : dut.prf_0.registers[commit_tag[i]];
+                    if (iss_wfp) iss_freg[rd] = value; else iss_reg[rd] = value;
+                end
+                if (writes) begin
+                    if (iss_wfp) wrote_f[commit_tid][rd] = 1;
+                    else         wrote_x[commit_tid][rd] = 1;
+                end
+                if (trace_fd_t[commit_tid] != 0)
+                    $fdisplay(trace_fd_t[commit_tid], "%h %s%0d %h", commit_pc[i], iss_wfp ? "f" : "x",
+                              writes ? rd : 0, writes ? value : 32'h0);
                 if (dut.commit_exception[i] !== e)
                     fail($sformatf("[%s] PC %h (%h): commit_exception=%s, expected %s", name, commit_pc[i],
                                    imem[commit_pc[i] >> 2], dut.commit_exception[i].name(), e.name()));
-                if (how != ISS_OK) begin done = 1; continue; end
+                if (how != ISS_OK) begin
+                    done_t[commit_tid] = 1;
+                    done = 1;
+                    foreach (done_t[t]) if (!done_t[t]) done = 0;
+                    continue;
+                end
                 if (commit_dest_valid[i] !== writes)
                     fail($sformatf("[%s] PC %h (%h): commit_dest_valid=%b, expected %b", name, commit_pc[i],
                                    imem[commit_pc[i] >> 2], commit_dest_valid[i], writes));
@@ -894,21 +1079,32 @@ module testbench;
         else if (end_exc != EXC_NONE && exception_pc !== end_pc)
             fail($sformatf("[%s] exception_pc %h, expected %h", name, exception_pc, end_pc));
         if (commit_valid != 0) fail($sformatf("[%s] commit after halt", name));
-        if (committed != expect_n)
+        if (committed != expect_n && !shared_test)
             fail($sformatf("[%s] committed %0d, the ISS executes %0d", name, committed, expect_n));
+        for (int t = 1; t < NT; t++) begin
+            if (committed_t[t] != expect_t[t] && !shared_test)
+                fail($sformatf("[%s] thread %0d committed %0d, its ISS executes %0d", name, t, committed_t[t], expect_t[t]));
+            if (dut.exception_t[t] !== end_exc_t[t])
+                fail($sformatf("[%s] thread %0d stopped with %s, expected %s", name, t, dut.exception_t[t].name(),
+                               end_exc_t[t].name()));
+        end
 
-        // final architectural state
-        for (int r = 1; r < 32; r++)
-            if (dut.prf_0.registers[dut.retire_map[r]] !== iss_reg[r])
-                fail($sformatf("[%s] final x%0d = %h, expected %h", name, r,
-                               dut.prf_0.registers[dut.retire_map[r]], iss_reg[r]));
-        if (`NUM_FU_FP > 0 && end_exc == EXC_NONE && dut.fcsr !== {iss_frm, iss_fflags})
-            fail($sformatf("[%s] final fcsr = %h, expected %h", name, dut.fcsr, {iss_frm, iss_fflags}));
-        if (`NUM_FU_FP > 0)
-            for (int r = 0; r < 32; r++)
-                if (dut.fp_prf_0.registers[int'(dut.fp_retire_map[r]) - `FP_TAG_BASE] !== iss_freg[r])
-                    fail($sformatf("[%s] final f%0d = %h, expected %h", name, r,
-                                   dut.fp_prf_0.registers[int'(dut.fp_retire_map[r]) - `FP_TAG_BASE], iss_freg[r]));
+        // final architectural state, every thread
+        for (int th = 0; th < NT; th++) begin
+            iss_switch(th);
+            for (int r = 1; r < 32; r++)
+                if (wrote_x[th][r] && dut.prf_0.registers[dut.retire_map[th][r]] !== iss_reg[r])
+                    fail($sformatf("[%s] thread %0d: final x%0d = %h, expected %h", name, th, r,
+                                   dut.prf_0.registers[dut.retire_map[th][r]], iss_reg[r]));
+            if (`NUM_FU_FP > 0 && end_exc_t[th] == EXC_NONE && dut.fcsr[th] !== {iss_frm, iss_fflags})
+                fail($sformatf("[%s] thread %0d: final fcsr = %h, expected %h", name, th, dut.fcsr[th], {iss_frm, iss_fflags}));
+            if (`NUM_FU_FP > 0)
+                for (int r = 0; r < 32; r++)
+                    if (wrote_f[th][r] && dut.fp_prf_0.registers[int'(dut.fp_retire_map[th][r]) - `FP_TAG_BASE] !== iss_freg[r])
+                        fail($sformatf("[%s] thread %0d: final f%0d = %h, expected %h", name, th, r,
+                                       dut.fp_prf_0.registers[int'(dut.fp_retire_map[th][r]) - `FP_TAG_BASE], iss_freg[r]));
+        end
+        iss_switch(0);
         // committed stores may still be draining: wait, then memory = mem.sv + dirty D-cache blocks
         begin
             automatic int g = 0;
@@ -917,8 +1113,13 @@ module testbench;
             check_memory(name);
         end
         total_ld += iss_ld; total_st += iss_st;
-        if (end_exc == EXC_NONE) check_tags(name);    // after an exception, younger work is still in flight
-        else n_exc_programs++;
+        begin   // after an exception, younger work is still in flight
+            automatic bit any_exc = 0;
+            foreach (end_exc_t[t]) if (end_exc_t[t] != EXC_NONE) any_exc = 1;
+            if (!any_exc) check_tags(name);
+            if (end_exc != EXC_NONE) n_exc_programs++;
+        end
+        set_thread1_wfi();   // the next program runs with thread 1 idle again, unless it says otherwise
 
         total_cycles    += cycles;
         total_committed += committed;
@@ -945,17 +1146,28 @@ module testbench;
         $display("Config: W=%0d, ALU ports=%0d, branch ports=%0d, CDBs=%0d, issue width=%0d, ROB=%0d, RS=%0d, PRF=%0d",
                  W, `NUM_FU_ALU, `NUM_FU_BRANCH, `NUM_CDB, `ISSUE_WIDTH, `ROB_SZ, `RS_SZ, `PHYS_REG_SZ);
 
-        // ---- one program from a file ----
+        foreach (trace_fd_t[t]) trace_fd_t[t] = 0;
+        set_thread1_wfi();
+
+        // ---- one program from a file (with more threads, +program1=<file>: thread 1's) ----
         if ($value$plusargs("program=%s", prog_file)) begin
             foreach (init_mem[a]) init_mem[a] = 8'h0;
             $readmemh(prog_file, init_mem);
             for (int k = 0; k < MAXN; k++) imem[k] = {init_mem[4 * k + 3], init_mem[4 * k + 2], init_mem[4 * k + 1], init_mem[4 * k]};
             prog_len = MAXN;
             $display("Program %s", prog_file);
-            if ($value$plusargs("trace=%s", prog_file)) trace_fd = $fopen(prog_file, "w");
+            if (NT > 1 && $value$plusargs("program1=%s", prog_file)) begin
+                logic [7:0] img [`MEM_SIZE_IN_BYTES];
+                foreach (img[a]) img[a] = 8'h0;
+                $readmemh(prog_file, img);
+                for (int a = 0; a < `THREAD_MEM_SZ; a++) t1_init[a] = img[a];
+                $display("Thread 1: program %s", prog_file);
+            end
+            if ($value$plusargs("trace=%s", prog_file)) trace_fd_t[0] = $fopen(prog_file, "w");
+            if (NT > 1 && $value$plusargs("trace1=%s", prog_file)) trace_fd_t[1] = $fopen(prog_file, "w");
             void'($value$plusargs("program=%s", prog_file));
             run_program(prog_file, 1);
-            if (trace_fd != 0) $fclose(trace_fd);
+            foreach (trace_fd_t[t]) if (trace_fd_t[t] != 0) $fclose(trace_fd_t[t]);
             report();
         end
 
@@ -1215,6 +1427,23 @@ module testbench;
         // (only for realistic table sizes: a tiny BTB/BHT aliases the loop's branches by design)
         if (`BTB_SZ >= 16 && `BHT_SZ >= 16 && last_flushes > 10)
             fail($sformatf("hot loop: %0d mispredicts; a trained BTB + bimodal should miss only while warming up", last_flushes));
+
+        if (`BP_TYPE == 1) begin
+            $display("Test 18b: a branch alternating taken / not taken, 200 iterations (tournament: gshare learns it)");
+            start_program();
+            emit(enc_i(3'b000, 7, 0, 12'd200));                        // x7 = iterations
+            emit(enc_i(3'b111, 8, 7, 12'd1));                          // loop: x8 = x7 & 1
+            emit(enc_b(3'b000, 8, 0, 8));                              // beq x8, x0, +8: alternates
+            emit(enc_i(3'b000, 9, 9, 12'd1));                          //   x9++ (odd iterations)
+            emit(enc_i(3'b000, 7, 7, -12'd1));                         // x7--
+            emit(enc_b(3'b001, 7, 0, -16));                            // bne x7, x0, loop
+            run_program("alternating branch");
+            $display("  (alternating branch: %0d branches/jumps, %0d mispredicts)", last_branches, last_flushes);
+            // bimodal misses about half of the 200 inner branches; with history (restored after every
+            // mispredict) only the warm-up misses
+            if (last_flushes > 30)
+                fail($sformatf("alternating branch: %0d mispredicts; the tournament should learn the pattern", last_flushes));
+        end
 
         // ---- random ----
         // ---- loads and stores ----
@@ -1557,6 +1786,128 @@ module testbench;
             end
         end
 
+        // ---- SMT: two live threads, each checked against its own ISS context ----
+        if (NT > 1) begin
+            $display("Test 51: 100 random program pairs on two threads (branches, loops, calls, wrong-path junk)");
+            for (int p = 0; p < 100; p++) begin
+                start_program();
+                while (prog_len < 62 + 250) emit_block(0, 7, 1);
+                move_to_thread1();
+                start_program();
+                while (prog_len < 62 + 250) emit_block(0, 7, 1);
+                run_program($sformatf("pair %0d", p));
+                if (errors > 0) break;
+            end
+
+            $display("Test 52: loads replayed in thread 1 (store address from a slow divide) while thread 0 runs random code");
+            for (int p = 0; p < 10; p++) begin
+                start_program();
+                emit(enc_i(3'b000, 11, 0, 12'd1));
+                emit(enc_i(3'b000, 7, 0, 12'd20));                         // x7 = iterations
+                emit(enc_r(7'b0000001, 3'b101, 9, DREG, 11));             // loop: x9 = x28 / 1
+                emit(enc_store(3'b010, 5, 9, 12'd4));                      // store address waits for the divide
+                emit(enc_load(3'b010, 6, DREG, 12'd4));                    // same address, known at once
+                emit(enc_i(3'b000, 5, 5, 12'd1));
+                emit(enc_i(3'b000, 7, 7, -12'd1));
+                emit(enc_b(3'b001, 7, 0, -20));                            // bne x7, x0, loop
+                move_to_thread1();
+                start_program();
+                while (prog_len < 62 + 250) emit_block(0, 7, 1);
+                run_program($sformatf("replay pair %0d", p));
+                if (errors > 0) break;
+            end
+
+            $display("Test 53: thread 1 stops on an illegal instruction while thread 0 keeps running");
+            for (int p = 0; p < 10; p++) begin
+                start_program();
+                for (int n = 0; n < 20; n++) emit(rand_alu(8, 0, 7));
+                emit({25'($urandom), 7'b1111111});                         // illegal: thread 1 stops here
+                for (int n = 0; n < 20; n++) emit(rand_alu(8, 0, 7));
+                move_to_thread1();
+                start_program();
+                while (prog_len < 62 + 250) emit_block(0, 7, 1);
+                run_program($sformatf("exception pair %0d", p));
+                if (errors > 0) break;
+            end
+
+            if (`NUM_FU_FP > 0 && `A_EXTENSION != 0) begin
+                $display("Test 54: serial ops in both threads: atomics (thread 1) and FP code with CSR ops (thread 0)");
+                for (int p = 0; p < 40; p++) begin
+                    automatic int start;
+                    start_program();
+                    start = prog_len;
+                    while (prog_len < start + 250) begin
+                        case ($urandom % 6)
+                            0:       emit_block(0, 7, 1);
+                            1, 2:    emit_amo_seq(1, 6);
+                            default: emit(rand_alu(8, 0, 7));
+                        endcase
+                    end
+                    move_to_thread1();
+                    start_program();
+                    while (prog_len < 94 + 300) begin
+                        if ($urandom % 5 == 0) emit_block(0, 7, 1);
+                        else emit(rand_fp(8, 0, 7));
+                    end
+                    run_program($sformatf("serial pair %0d", p));
+                    if (errors > 0) break;
+                end
+            end
+
+            $display("Test 55: a long thread (2000 instructions) next to a short one, 10 pairs");
+            for (int p = 0; p < 10; p++) begin
+                start_program();
+                while (prog_len < 62 + 100) emit_block(0, 7, 1);
+                move_to_thread1();
+                start_program();
+                while (prog_len < 62 + 2000) begin
+                    if ($urandom % 4 == 0) emit_block(0, 7, 1);
+                    else emit(rand_alu(32, 0, 31));
+                end
+                run_program($sformatf("long-short pair %0d", p));
+                if (errors > 0) break;
+            end
+
+            // ---- shared data: the threads contend; the ISS takes the core's values for what they
+            //      read from the shared window, and the results are checked as invariants ----
+            if (`A_EXTENSION != 0) begin
+                shared_test = 1;
+                $display("Test 56: a shared counter, 100 amoadd.w per thread (x5)");
+                for (int p = 0; p < 5; p++) begin
+                    shared_prog(0, 100); move_to_thread1(); shared_prog(0, 100);
+                    run_program($sformatf("shared amoadd %0d", p));
+                    if (mem_word('h7000) !== 32'd200) fail($sformatf("shared amoadd %0d: counter %0d, expected 200", p, mem_word('h7000)));
+                end
+                $display("Test 57: LR / SC increments of a shared word, 100 per thread, retried when the SC fails (x5)");
+                for (int p = 0; p < 5; p++) begin
+                    shared_prog(1, 100); move_to_thread1(); shared_prog(1, 100);
+                    run_program($sformatf("shared lr/sc %0d", p));
+                    if (mem_word('h7004) !== 32'd200) fail($sformatf("shared lr/sc %0d: counter %0d, expected 200", p, mem_word('h7004)));
+                end
+                $display("Test 58: a spinlock (amoswap) around a plain load / add / store, 100 per thread (x5)");
+                for (int p = 0; p < 5; p++) begin
+                    shared_prog(2, 100); move_to_thread1(); shared_prog(2, 100);
+                    run_program($sformatf("spinlock %0d", p));
+                    if (mem_word('h700c) !== 32'd200) fail($sformatf("spinlock %0d: counter %0d, expected 200 (lost updates)", p, mem_word('h700c)));
+                    if (mem_word('h7008) !== 32'd0)   fail($sformatf("spinlock %0d: lock %0d, expected released", p, mem_word('h7008)));
+                end
+                $display("Test 59: amoadd in one thread, the spinlock in the other (x5)");
+                for (int p = 0; p < 5; p++) begin
+                    shared_prog(p % 2 == 0 ? 0 : 2, 100); move_to_thread1(); shared_prog(p % 2 == 0 ? 2 : 0, 100);
+                    run_program($sformatf("mixed shared %0d", p));
+                    if (mem_word('h7000) !== 32'd100 || mem_word('h700c) !== 32'd100)
+                        fail($sformatf("mixed shared %0d: counters %0d / %0d, expected 100 / 100", p, mem_word('h7000), mem_word('h700c)));
+                end
+                $display("Test 60: same-address loads stay in order while the other thread writes the word (x5)");
+                for (int p = 0; p < 5; p++) begin
+                    shared_prog(4, 300); move_to_thread1(); shared_prog(3, 150);
+                    run_program($sformatf("load order %0d", p));
+                    if (mem_word('h7014) !== 32'd0) fail($sformatf("load order %0d: a younger load saw an older value", p));
+                end
+                shared_test = 0;
+            end
+        end
+
         report();
     end
 
@@ -1574,8 +1925,8 @@ module testbench;
                  fp_issue, fp_blocked, fp_cdb_wait, stall_fp_freelist);
         $display("  (I-cache: fetch waited %0d of %0d cycles)", total_istall, total_cycles);
         $display("  (IPF_DEPTH = %0d: %0d prefetches issued, %0d used, %0d dropped, %0d skipped as cached, %0d cycles fetch waited for one)",
-                 `IPF_DEPTH, dut.iprefetch_0.n_issued, dut.iprefetch_0.n_useful, dut.iprefetch_0.n_dropped,
-                 dut.iprefetch_0.n_skipped, dut.iprefetch_0.n_late);
+                 `IPF_DEPTH, dut.gen_ipf[0].iprefetch_0.n_issued, dut.gen_ipf[0].iprefetch_0.n_useful, dut.gen_ipf[0].iprefetch_0.n_dropped,
+                 dut.gen_ipf[0].iprefetch_0.n_skipped, dut.gen_ipf[0].iprefetch_0.n_late);
         $display("  (loads %0d, stores %0d committed; %0d loads forwarded from the store queue; D-cache %0d hits, %0d misses, %0d writebacks)",
                  total_ld, total_st, total_fwd, dut.dcache_0.n_hits, dut.dcache_0.n_misses, dut.dcache_0.n_writebacks);
         begin
